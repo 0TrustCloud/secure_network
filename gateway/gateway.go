@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"ithub.com/gddisney/secure_network"
+	"github.com/gddisney/secure_network/router"
 	"github.com/gddisney/ultimate_db"
 	
 	"github.com/flynn/noise"
