@@ -1,4 +1,4 @@
-package gateway
+package secure_network
 
 import (
 	"encoding/json"
