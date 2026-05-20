@@ -6,7 +6,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/gddisney/secure_network/router"
 	"github.com/gddisney/ultimate_db"
 	
 	"github.com/flynn/noise"
@@ -14,7 +13,7 @@ import (
 )
 
 type NoiseGateway struct {
-	router *router.Router
+	router *router
 	cipher noise.CipherSuite
 	sPriv  []byte
 	sPub   []byte
