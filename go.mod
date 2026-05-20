@@ -4,8 +4,8 @@ go 1.23
 
 require (
 	github.com/flynn/noise v1.1.0
-	github.com/gddisney/guikit v1.0.2
-	github.com/gddisney/ultimate_db v1.0.1
+	github.com/gddisney/guikit v1.0.3
+	github.com/gddisney/ultimate_db v1.0.4
 	github.com/quic-go/quic-go v0.42.0
 )
 
