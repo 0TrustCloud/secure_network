@@ -48,14 +48,14 @@ type PeerRoute struct {
 	db             *ultimate_db.DB
 	gateway        *Gateway
 	// Updated Provider to Manager based on webauthnext conventions
-	auth           *webauthnext.Manager 
+	auth           *webauthnext.Provider 
 	localID        NodeID
 	policies       map[NodeID]AccessLevel
 	ingressHandler IngressHandler
 }
 
 // Updated Provider to Manager in the constructor signature
-func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Manager, hardwareKey []byte) *PeerRoute {
+func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte) *PeerRoute {
 	localHash := sha256.Sum256(hardwareKey)
 	return &PeerRoute{
 		db:       db,
