@@ -1,4 +1,4 @@
-package router
+package secure_network
 
 import (
 	"bufio"
