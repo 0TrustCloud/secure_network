@@ -1,4 +1,4 @@
-package peerroute
+package secure_network
 
 import (
 	"bytes"
