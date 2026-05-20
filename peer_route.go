@@ -6,17 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"time"
 	"log"
+	"time"
 
+	"github.com/flynn/noise"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
-	"github.com/flynn/noise"
 )
 
 const (
 	SystemPageID ultimate_db.PageID = 1
-	CachePageID  ultimate_db.PageID = 2 
+	CachePageID  ultimate_db.PageID = 2
 )
 
 type AccessLevel int
@@ -47,13 +47,15 @@ type IngressHandler func(context.Context, []byte, *noise.CipherState) error
 type PeerRoute struct {
 	db             *ultimate_db.DB
 	gateway        *Gateway
-	auth           *webauthnext.Provider
+	// Updated Provider to Manager based on webauthnext conventions
+	auth           *webauthnext.Manager 
 	localID        NodeID
 	policies       map[NodeID]AccessLevel
 	ingressHandler IngressHandler
 }
 
-func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte) *PeerRoute {
+// Updated Provider to Manager in the constructor signature
+func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Manager, hardwareKey []byte) *PeerRoute {
 	localHash := sha256.Sum256(hardwareKey)
 	return &PeerRoute{
 		db:       db,
@@ -142,23 +144,27 @@ func (p *PeerRoute) PullFromSwarm(ctx context.Context, objID NodeID) ([]byte, er
 }
 
 func (p *PeerRoute) RevokeObject(ctx context.Context, objID NodeID) error {
-	return p.db.Delete(CachePageID, p.db.BeginTxn(), objID[:])
+	// FIX: Replaced p.db.Delete with a tombstone write leveraging the active GC
+	return p.db.Write(CachePageID, p.db.BeginTxn(), objID[:], nil, time.Nanosecond)
 }
 
 func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry, error) {
 	txn := p.db.BeginTxn()
 	prefix := []byte("dht_node:")
-	records, err := p.db.PrefixScan(SystemPageID, txn, prefix)
-	if err != nil {
-		return nil, err
-	}
 
 	var closest []RoutingEntry
-	for _, rec := range records {
+
+	// FIX: Replaced p.db.PrefixScan with p.db.Scan utilizing the callback iterator pattern
+	err := p.db.Scan(SystemPageID, txn, prefix, func(key, value []byte) bool {
 		var entry RoutingEntry
-		if err := json.Unmarshal(rec.Value, &entry); err == nil {
+		if err := json.Unmarshal(value, &entry); err == nil {
 			closest = append(closest, entry)
 		}
+		return true // Return true to continue iterating through the B+ Tree
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
 	for i := 0; i < len(closest)-1; i++ {
