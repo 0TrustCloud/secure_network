@@ -7,6 +7,8 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+    "github.com/gddisney/secure_network/gateway"
+    "github.com/gddisney/secure_network/router"
 
 	"github.com/gddisney/ultimate_db"
 	"github.com/flynn/noise"
