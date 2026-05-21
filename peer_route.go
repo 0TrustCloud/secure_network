@@ -47,14 +47,12 @@ type IngressHandler func(context.Context, []byte, *noise.CipherState) error
 type PeerRoute struct {
 	db             *ultimate_db.DB
 	gateway        *Gateway
-	// Updated Provider to Manager based on webauthnext conventions
-	auth           *webauthnext.Provider 
+	auth           *webauthnext.Provider
 	localID        NodeID
 	policies       map[NodeID]AccessLevel
 	ingressHandler IngressHandler
 }
 
-// Updated Provider to Manager in the constructor signature
 func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte) *PeerRoute {
 	localHash := sha256.Sum256(hardwareKey)
 	return &PeerRoute{
@@ -115,7 +113,6 @@ func (p *PeerRoute) PublishToSwarm(ctx context.Context, payload []byte) (NodeID,
 	copy(objID[:], hash[:])
 
 	signature := p.auth.SignPayload(payload)
-
 	obj := SwarmObject{
 		ObjectID:  objID,
 		OwnerID:   p.localID,
@@ -129,12 +126,18 @@ func (p *PeerRoute) PublishToSwarm(ctx context.Context, payload []byte) (NodeID,
 		return objID, err
 	}
 
-	p.db.Write(CachePageID, p.db.BeginTxn(), objID[:], objBytes, 72*time.Hour)
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	p.db.Write(CachePageID, txn, objID[:], objBytes, 72*time.Hour)
 	return objID, nil
 }
 
 func (p *PeerRoute) PullFromSwarm(ctx context.Context, objID NodeID) ([]byte, error) {
-	valBytes, err := p.db.Read(CachePageID, p.db.BeginTxn(), objID[:])
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	valBytes, err := p.db.Read(CachePageID, txn, objID[:])
 	if err == nil && valBytes != nil {
 		var obj SwarmObject
 		json.Unmarshal(valBytes, &obj)
@@ -144,17 +147,21 @@ func (p *PeerRoute) PullFromSwarm(ctx context.Context, objID NodeID) ([]byte, er
 }
 
 func (p *PeerRoute) RevokeObject(ctx context.Context, objID NodeID) error {
-	// FIX: Replaced p.db.Delete with a tombstone write leveraging the active GC
-	return p.db.Write(CachePageID, p.db.BeginTxn(), objID[:], nil, time.Nanosecond)
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	// Replaced p.db.Delete with a tombstone write leveraging the active GC
+	return p.db.Write(CachePageID, txn, objID[:], nil, time.Nanosecond)
 }
 
 func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry, error) {
 	txn := p.db.BeginTxn()
-	prefix := []byte("dht_node:")
+	defer p.db.CommitTxn(txn)
 
+	prefix := []byte("dht_node:")
 	var closest []RoutingEntry
 
-	// FIX: Replaced p.db.PrefixScan with p.db.Scan utilizing the callback iterator pattern
+	// Replaced p.db.PrefixScan with p.db.Scan utilizing the callback iterator pattern
 	err := p.db.Scan(SystemPageID, txn, prefix, func(key, value []byte) bool {
 		var entry RoutingEntry
 		if err := json.Unmarshal(value, &entry); err == nil {
@@ -193,10 +200,13 @@ func (p *PeerRoute) UpdateRoutingTable(remoteID NodeID, address string, dbscProo
 		ID:      remoteID,
 		Address: address,
 	}
-
 	valBytes, _ := json.Marshal(entry)
 	key := append([]byte("dht_node:"), remoteID[:]...)
-	return p.db.Write(SystemPageID, p.db.BeginTxn(), key, valBytes, 2*time.Hour)
+
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	return p.db.Write(SystemPageID, txn, key, valBytes, 2*time.Hour)
 }
 
 func xorDistance(a, b NodeID) NodeID {
