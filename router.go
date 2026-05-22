@@ -432,5 +432,3 @@ func generateEphemeralTLS() (*tls.Config, error) {
 		NextProtos:   []string{"h3", "h2", "http/1.1"},
 	}, nil
 }
-
-```
