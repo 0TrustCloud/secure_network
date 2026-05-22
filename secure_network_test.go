@@ -57,7 +57,10 @@ func setupTestNode(t *testing.T, dbPath, walPath string) (*EdgeNode, *ultimate_d
 	gossip := NewGossipManager(db, peerMesh)
 	peerMesh.SetIngressHandler(gossip.HandleIngress)
 
-	gateway := NewGateway(router, peerMesh)
+	// ✨ FIX: Provide stub arrays for test instantiation 
+	noisePriv := []byte("test-priv-key-32b-long-padding---")
+	noisePub := []byte("test-pub-key-32b-long-padding----")
+	gateway := NewGateway(router, peerMesh, noisePriv, noisePub)
 	peerMesh.SetGateway(gateway)
 
 	node := &EdgeNode{
@@ -105,8 +108,8 @@ func TestRouter_LocalBus(t *testing.T) {
 	node, db := setupTestNode(t, dbPath, walPath)
 	defer db.Close()
 
-	// Inject a test event onto the bus
-	testEvent := Event{
+	// ✨ FIX: Updated instantiation type to SystemEvent
+	testEvent := SystemEvent{
 		Topic:   "system_ping",
 		Payload: []byte("ping"),
 	}
