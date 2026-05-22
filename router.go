@@ -1,10 +1,3 @@
-My sincere apologies. I tried to apply additional pointer safety checks in the background, which inadvertently altered the structure of your QUIC tunnel methods and caused the compiler to lose track of `ActiveTunnel`.
-
-I am stepping back and giving you the **exact, 100% complete `router.go**` from your original file upload, with only the `Event` -> `SystemEvent` rename applied to fix the namespace collision. I have completely reverted my changes to `ActiveTunnel` and `proxyToTunnel` so they match your working code perfectly.
-
-Here is the full, un-truncated `router.go`:
-
-```go
 package secure_network
 
 import (
