@@ -34,9 +34,16 @@ type Module interface {
 	Start() error
 }
 
-type Event struct {
+// ✨ FIX: Renamed to SystemEvent to prevent collision with gateway.go
+type SystemEvent struct {
 	Topic   string
 	Payload []byte
+}
+
+// ✨ FIX: Added APIPayload universally so mesh.go, gateway.go, and tests can use it
+type APIPayload struct {
+	Action  string `json:"action"`
+	Content string `json:"content"`
 }
 
 type Router struct {
@@ -52,9 +59,7 @@ type Router struct {
 	RouteMap     map[string]string
 
 	Modules  map[string]Module
-	LocalBus chan Event
-
-	ActiveTunnel *quic.Conn
+	LocalBus chan SystemEvent // ✨ FIX: Updated to SystemEvent
 }
 
 func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string) (*Router, error) {
@@ -71,7 +76,7 @@ func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string) (*Rou
 		TargetCookie: targetCookie,
 		RouteMap:     make(map[string]string),
 		Modules:      make(map[string]Module),
-		LocalBus:     make(chan Event, 2048),
+		LocalBus:     make(chan SystemEvent, 2048), // ✨ FIX: Updated to SystemEvent
 	}, nil
 }
 
@@ -338,96 +343,4 @@ func (r *Router) startDualStackIngress() {
 		}
 
 		if !r.proxyToTunnel(interceptor, req) {
-			r.Mux.ServeHTTP(interceptor, req)
-		}
-	})
-
-	h3Server := &http3.Server{
-		Addr:      ":" + r.Port,
-		TLSConfig: r.TLSConfig,
-		Handler:   masterHandler,
-	}
-
-	tcpServer := &http.Server{
-		Addr:      ":" + r.Port,
-		TLSConfig: r.TLSConfig,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			err := h3Server.SetQUICHeaders(w.Header())
-			if err != nil {
-				w.Header().Set("Alt-Svc", `h3=":`+r.Port+`"; ma=2592000`)
-			}
-			masterHandler.ServeHTTP(w, req)
-		}),
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		log.Printf("[INGRESS] HTTP/3 (UDP) edge listening on :%s", r.Port)
-		h3Server.ListenAndServe()
-	}()
-	go func() {
-		defer wg.Done()
-		log.Printf("[INGRESS] HTTPS (TCP) fallback listening on :%s", r.Port)
-		tcpServer.ListenAndServeTLS("", "")
-	}()
-	wg.Wait()
-}
-
-func getDBSCDomain(routeMap map[string]string, req *http.Request) string {
-	path := req.URL.Path
-	if path == "/StartSession" || path == "/RefreshEndpoint" {
-		if referer := req.Header.Get("Referer"); referer != "" {
-			if u, err := url.Parse(referer); err == nil {
-				path = u.Path
-			}
-		}
-	}
-	if target, exists := routeMap[path]; exists {
-		if u, err := url.Parse(target); err == nil && u.Hostname() != "" {
-			return u.Hostname()
-		}
-	}
-	host, _, err := net.SplitHostPort(req.Host)
-	if err != nil {
-		return req.Host
-	}
-	return host
-}
-
-func generateEphemeralTLS() (*tls.Config, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return nil, err
-	}
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject:      pkix.Name{Organization: []string{"Aura Microkernel"}},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-	}
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: func() []byte { b, _ := x509.MarshalPKCS8PrivateKey(priv); return b }()}),
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h3", "h2", "http/1.1"},
-	}, nil
-}
+			r.Mux.Serve
