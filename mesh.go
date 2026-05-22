@@ -1,12 +1,15 @@
 package secure_network
+
 import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64" // Fixed signature corruption
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/flynn/noise"
 	"github.com/gddisney/ultimate_db"
@@ -18,13 +21,6 @@ const (
 	ConfigPageID ultimate_db.PageID = 99
 	TaskPageID   ultimate_db.PageID = 100
 )
-
-type AgentPayload struct {
-	Action  string `json:"action"`
-	Content string `json:"content,omitempty"`
-	Target  string `json:"target,omitempty"`
-	Value   int    `json:"value,omitempty"`
-}
 
 type MeshNode struct {
 	db        *ultimate_db.DB
@@ -39,7 +35,6 @@ type MeshNode struct {
 }
 
 // loadOrGenerateKeys retrieves the mesh node's identity from the local ultimate_db.
-// If no identity exists, it generates the Noise and DBSC keys and persists them.
 func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey, error) {
 	txn := db.BeginTxn()
 	defer db.CommitTxn(txn)
@@ -48,7 +43,6 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 	noisePub, err2 := db.Read(ConfigPageID, txn, []byte("mesh_noise_pub"))
 	dbscPrivRaw, err3 := db.Read(ConfigPageID, txn, []byte("mesh_dbsc_priv"))
 
-	// Return existing keys if found
 	if err1 == nil && err2 == nil && err3 == nil {
 		return noisePriv, noisePub, ed25519.PrivateKey(dbscPrivRaw), nil
 	}
@@ -148,8 +142,8 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	return nil
 }
 
-// SendAction pushes an encrypted payload through the established tunnel.
-func (m *MeshNode) SendAction(payload AgentPayload) error {
+// SendAction pushes an encrypted unified APIPayload through the tunnel.
+func (m *MeshNode) SendAction(payload APIPayload) error {
 	if m.csSend == nil || m.stream == nil {
 		return fmt.Errorf("mesh tunnel is not established")
 	}
@@ -168,8 +162,7 @@ func (m *MeshNode) SendAction(payload AgentPayload) error {
 	return err
 }
 
-// listen handles the incoming stream, specifically intercepting DBSC heartbeats
-// and dumping other traffic into the local ultimate_db for processing.
+// listen handles the incoming stream, responding to DBSC challenges cleanly.
 func (m *MeshNode) listen() {
 	buf := make([]byte, 4096)
 	for {
@@ -185,27 +178,29 @@ func (m *MeshNode) listen() {
 			continue
 		}
 
-		var req AgentPayload
+		var req APIPayload
 		if err := json.Unmarshal(decrypted, &req); err != nil {
 			continue
 		}
 
-		// Intercept and satisfy the hardware-bound identity challenge
+		// Intercept and satisfy the hardware-bound identity challenge safely
 		if req.Action == "dbsc_heartbeat_req" {
 			challenge := []byte(req.Content)
 			signature := ed25519.Sign(m.dbscPriv, challenge)
+			
+			// Base64 encode raw cryptographic bytes to prevent string mutation bugs
+			encodedSig := base64.StdEncoding.EncodeToString(signature)
 
-			m.SendAction(AgentPayload{
+			m.SendAction(APIPayload{
 				Action:  "dbsc_heartbeat_resp",
-				Content: string(signature),
+				Content: encodedSig,
 			})
 			continue
 		}
 
-		// Route valid inbound payloads directly into the local database
-		// so that standard local workers can pick up tasks via DB.Scan()
+		// Route incoming execution requests into local queue safely using unique keys
 		txnID := m.db.BeginTxn()
-		taskID := fmt.Sprintf("task:%d", txnID) // Using txnID or timestamp as a queue key
+		taskID := fmt.Sprintf("task:%d", time.Now().UnixNano()) 
 		
 		err = m.db.Write(TaskPageID, txnID, []byte(taskID), decrypted, 0)
 		m.db.CommitTxn(txnID)
