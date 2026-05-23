@@ -226,7 +226,30 @@ type Event struct {
 	Topic   string
 	Payload []byte
 }
-
+// Add to gateway.go
+func (g *Gateway) Listen(port string) error {
+    // We use the same TLS config as the router
+    listener, err := quic.ListenAddr(":"+port, g.router.TLSConfig, &quic.Config{
+        EnableDatagrams: true,
+        KeepAlivePeriod: 30 * time.Second,
+    })
+    if err != nil {
+        return err
+    }
+    log.Printf("[GATEWAY] Secure Mesh Tunnel active on UDP :%s", port)
+    for {
+        conn, err := listener.Accept(context.Background())
+        if err != nil { continue }
+        
+        // ACCEPT THE STREAM HERE
+        go func(c quic.Connection) {
+            stream, err := c.AcceptStream(context.Background())
+            if err == nil {
+                g.HandleSecureStream(stream)
+            }
+        }(conn)
+    }
+}
 func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
