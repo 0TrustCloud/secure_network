@@ -1,7 +1,6 @@
 package secure_network
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
