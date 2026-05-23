@@ -28,8 +28,8 @@ type Gateway struct {
 	cipher         noise.CipherSuite
 	sPriv          []byte
 	sPub           []byte
-	
-	activeSessions sync.Map 
+
+	activeSessions sync.Map
 }
 
 func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte) *Gateway {
@@ -87,7 +87,7 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	}
 
 	remoteKey := hs.PeerStatic()
-	
+
 	if !g.isIdentityValid(remoteKey) {
 		log.Printf("[GATEWAY] Revoked or unknown key attempted connection. Dropping stream.")
 		return
@@ -98,14 +98,14 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		log.Printf("[GATEWAY] Failed to complete handshake: %v", err)
 		return
 	}
-	
+
 	if _, err = stream.Write(respMsg); err != nil {
 		return
 	}
 
 	sessionID := string(remoteKey)
 	g.activeSessions.Store(sessionID, time.Now().Unix())
-	
+
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
 	go g.monitorHeartbeat(stream, csSend, remoteKey, stopHeartbeat)
@@ -123,14 +123,14 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		}
 		g.routeToAPI(remoteKey, decrypted)
 	}
-	
+
 	g.activeSessions.Delete(sessionID)
 }
 
 func (g *Gateway) isIdentityValid(pubKey []byte) bool {
 	txn := g.router.DB.BeginTxn()
 	defer g.router.DB.CommitTxn(txn)
-	
+
 	_, err := g.router.DB.Read(IdentityPageID, txn, pubKey)
 	return err == nil
 }
@@ -156,11 +156,11 @@ func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState
 				Action:  "dbsc_heartbeat_req",
 				Content: string(challenge),
 			}
-			
+
 			data, _ := json.Marshal(payload)
 			enc, _ := csSend.Encrypt(nil, nil, data)
 			stream.Write(enc)
-			
+
 		case <-stop:
 			return
 		}
@@ -292,7 +292,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 
 		rpcPayload["signer"] = signer
 		enrichedPayload, _ := json.Marshal(rpcPayload)
-		
+
 		g.router.LocalBus <- SystemEvent{
 			Topic:   "rpc_ingress",
 			Payload: enrichedPayload,
