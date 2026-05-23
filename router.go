@@ -429,6 +429,6 @@ func generateEphemeralTLS() (*tls.Config, error) {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h3", "h2", "http/1.1"},
+		NextProtos:   []string{"secure-overlay", "h3", "h2", "http/1.1"},
 	}, nil
 }
