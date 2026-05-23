@@ -64,6 +64,14 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 
 	return kp.Private, kp.Public, dbscPriv, nil
 }
+// Add these to secure_network/mesh.go
+func (m *MeshNode) GetNoisePubKey() []byte {
+	return m.noisePub
+}
+
+func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey {
+	return m.dbscPriv
+}
 
 func NewMeshNode(db *ultimate_db.DB, gatePub []byte) (*MeshNode, error) {
 	nPriv, nPub, dPriv, err := loadOrGenerateKeys(db)
