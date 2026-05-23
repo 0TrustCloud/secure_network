@@ -1,8 +1,9 @@
 package secure_network
 
 import (
-	"crypto/tls"
+	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -28,7 +29,6 @@ type Gateway struct {
 	sPriv          []byte
 	sPub           []byte
 	
-	// Tracks the last successful heartbeat for active tunnels
 	activeSessions sync.Map 
 }
 
@@ -42,7 +42,6 @@ func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte) *Gateway {
 	}
 }
 
-// HTTP & TLS Application Handlers (From Impl 2)
 func (g *Gateway) SetApplicationHandler(handler http.HandlerFunc) {
 	if g.router != nil {
 		g.router.Mux.Handle("/", handler)
@@ -60,7 +59,6 @@ func (g *Gateway) ListenAndServe(port string, tlsConfig *tls.Config) error {
 	return nil
 }
 
-// HandleSecureStream processes the incoming QUIC stream and establishes the Noise tunnel
 func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	defer stream.Close()
 
@@ -90,13 +88,11 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 
 	remoteKey := hs.PeerStatic()
 	
-	// Validate identity using the Router's DB
 	if !g.isIdentityValid(remoteKey) {
 		log.Printf("[GATEWAY] Revoked or unknown key attempted connection. Dropping stream.")
 		return
 	}
 
-	// Retain both csSend and csRecv to support bidirectional events (like heartbeats)
 	respMsg, csSend, csRecv, err := hs.WriteMessage(nil, nil)
 	if err != nil {
 		log.Printf("[GATEWAY] Failed to complete handshake: %v", err)
@@ -110,7 +106,6 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	sessionID := string(remoteKey)
 	g.activeSessions.Store(sessionID, time.Now().Unix())
 	
-	// Start the DBSC Heartbeat monitor for this tunnel
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
 	go g.monitorHeartbeat(stream, csSend, remoteKey, stopHeartbeat)
@@ -140,7 +135,6 @@ func (g *Gateway) isIdentityValid(pubKey []byte) bool {
 	return err == nil
 }
 
-// monitorHeartbeat demands a signature from the client/mesh node
 func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState, signer []byte, stop <-chan struct{}) {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
@@ -173,7 +167,6 @@ func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState
 	}
 }
 
-// ScrubbingCycle runs background revocation sweeps (From Impl 2)
 func (g *Gateway) ScrubbingCycle() {
 	ticker := time.NewTicker(24 * time.Hour)
 	for range ticker.C {
@@ -221,35 +214,11 @@ type ContentMeta struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-// Event struct for LocalBus integration
 type Event struct {
 	Topic   string
 	Payload []byte
 }
-// Add to gateway.go
-func (g *Gateway) Listen(port string) error {
-    // We use the same TLS config as the router
-    listener, err := quic.ListenAddr(":"+port, g.router.TLSConfig, &quic.Config{
-        EnableDatagrams: true,
-        KeepAlivePeriod: 30 * time.Second,
-    })
-    if err != nil {
-        return err
-    }
-    log.Printf("[GATEWAY] Secure Mesh Tunnel active on UDP :%s", port)
-    for {
-        conn, err := listener.Accept(context.Background())
-        if err != nil { continue }
-        
-        // ACCEPT THE STREAM HERE
-        go func(c quic.Connection) {
-            stream, err := c.AcceptStream(context.Background())
-            if err == nil {
-                g.HandleSecureStream(stream)
-            }
-        }(conn)
-    }
-}
+
 func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -257,7 +226,6 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 		return
 	}
 
-	// [CRITICAL FIX] Ensure transactions are always committed so the DB doesn't hang!
 	txnID := g.router.DB.BeginTxn()
 	defer g.router.DB.CommitTxn(txnID)
 
@@ -265,9 +233,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 
 	switch req.Action {
 	case "dbsc_heartbeat_resp":
-		// The client successfully responded to the hardware-bound identity challenge
 		g.activeSessions.Store(string(signer), now)
-		// For strict DBSC, verify the Ed25519 signature against the stored client DB_KEY here.
 
 	case "post":
 		postID := fmt.Sprintf("post:%d:%x", time.Now().UnixNano(), signer[:4])
