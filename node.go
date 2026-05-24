@@ -2,19 +2,24 @@ package secure_network
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"log"
 
+	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
 )
 
 type EdgeNode struct {
-	DB       *ultimate_db.DB
-	Router   *Router
-	PeerMesh *PeerRoute
-	Gossip   *GossipManager
-	Gateway  *Gateway
+	DB             *ultimate_db.DB
+	Router         *Router
+	PeerMesh       *PeerRoute
+	Gossip         *GossipManager
+	Gateway        *Gateway
+	PolicyEngine   *secure_policy.PolicyEngine
+	SessionManager *secure_policy.SessionManager
 }
 
 func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth *webauthnext.Provider) (*EdgeNode, error) {
@@ -36,15 +41,24 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	gossip := NewGossipManager(db, peerMesh)
 	peerMesh.SetIngressHandler(gossip.HandleIngress)
 
-	router, _ := NewRouter(db, nil, "secure_session_token")
+	// Generate RSA key for Session Manager signing
+	// In production, this should ideally be loaded from disk or a secure enclave
+	sessionKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
 
-	// ✨ FIX: Load or generate keys to satisfy the updated NewGateway constructor
+	pe := secure_policy.NewPolicyEngine(db)
+	sm := secure_policy.NewSessionManager(db, sessionKey)
+
+	// Updated NewRouter call to include the PolicyEngine and SessionManager
+	router, _ := NewRouter(db, nil, "secure_session_token", pe, sm)
+
 	noisePriv, noisePub, _, err := loadOrGenerateKeys(db)
 	if err != nil {
 		return nil, err
 	}
 
-	// ✨ FIX: Passed the necessary noisePriv and noisePub byte arrays
 	gateway := NewGateway(router, peerMesh, noisePriv, noisePub)
 	peerMesh.SetGateway(gateway)
 
@@ -52,11 +66,13 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	router.Attach(rpcEngine)
 
 	return &EdgeNode{
-		DB:       db,
-		Router:   router,
-		PeerMesh: peerMesh,
-		Gossip:   gossip,
-		Gateway:  gateway,
+		DB:             db,
+		Router:         router,
+		PeerMesh:       peerMesh,
+		Gossip:         gossip,
+		Gateway:        gateway,
+		PolicyEngine:   pe,
+		SessionManager: sm,
 	}, nil
 }
 
