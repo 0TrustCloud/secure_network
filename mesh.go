@@ -6,12 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/flynn/noise"
@@ -24,9 +21,6 @@ const (
 	TaskPageID   ultimate_db.PageID = 100
 )
 
-// NOTE: APIPayload has been removed from this file to prevent redeclaration 
-// conflicts since it is already defined in gateway.go.
-
 type MeshNode struct {
 	db        *ultimate_db.DB
 	noisePriv []byte
@@ -34,10 +28,9 @@ type MeshNode struct {
 	dbscPriv  ed25519.PrivateKey
 	gatePub   []byte
 	cipher    noise.CipherSuite
-	stream    quic.Stream // Clean interface allocation (not a pointer-to-interface)
+	stream    *quic.Stream // Keeping the pointer here
 	csSend    *noise.CipherState
 	csRecv    *noise.CipherState
-	writeMu   sync.Mutex  // Guards concurrent stream serialization
 }
 
 func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey, error) {
@@ -71,7 +64,7 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 
 	return kp.Private, kp.Public, dbscPriv, nil
 }
-
+// Add these to secure_network/mesh.go
 func (m *MeshNode) GetNoisePubKey() []byte {
 	return m.noisePub
 }
@@ -111,6 +104,7 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	if err != nil {
 		return fmt.Errorf("mesh stream open failed: %w", err)
 	}
+	// ✨ FIX: Removed the '&' because OpenStreamSync already returns the pointer type we need
 	m.stream = stream
 
 	hs, err := noise.NewHandshakeState(noise.Config{
@@ -130,18 +124,18 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 		return fmt.Errorf("mesh write message failed: %w", err)
 	}
 
-	// Frame and write the initial Noise handshake frame
-	if err = m.writeFramed(msg); err != nil {
+	// ✨ FIX: Call stream functions directly
+	if _, err = m.stream.Write(msg); err != nil {
 		return fmt.Errorf("mesh stream write failed: %w", err)
 	}
 
-	// Read and resolve the response handshake frame safely
-	respBuf, err := m.readFramed()
+	buf := make([]byte, 4096)
+	n, err := m.stream.Read(buf)
 	if err != nil {
 		return fmt.Errorf("mesh stream read failed: %w", err)
 	}
 
-	if _, _, _, err = hs.ReadMessage(nil, respBuf); err != nil {
+	if _, _, _, err = hs.ReadMessage(nil, buf[:n]); err != nil {
 		return fmt.Errorf("mesh handshake rejected by Gateway: %w", err)
 	}
 
@@ -155,7 +149,6 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 }
 
 func (m *MeshNode) SendAction(payload APIPayload) error {
-	// Clean interface check against nil
 	if m.csSend == nil || m.stream == nil {
 		return fmt.Errorf("mesh tunnel is not established")
 	}
@@ -170,18 +163,22 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 		return fmt.Errorf("mesh encryption failed: %w", err)
 	}
 
-	return m.writeFramed(encrypted)
+	// ✨ FIX: Call stream functions directly
+	_, err = m.stream.Write(encrypted)
+	return err
 }
 
 func (m *MeshNode) listen() {
+	buf := make([]byte, 4096)
 	for {
-		buf, err := m.readFramed()
+		// ✨ FIX: Call stream functions directly
+		n, err := m.stream.Read(buf)
 		if err != nil {
 			log.Printf("[SECURE_MESH] Stream closed or read error: %v", err)
 			break
 		}
 
-		decrypted, err := m.csRecv.Decrypt(nil, nil, buf)
+		decrypted, err := m.csRecv.Decrypt(nil, nil, buf[:n])
 		if err != nil {
 			log.Printf("[SECURE_MESH] Decryption failed on incoming message: %v", err)
 			continue
@@ -195,6 +192,7 @@ func (m *MeshNode) listen() {
 		if req.Action == "dbsc_heartbeat_req" {
 			challenge := []byte(req.Content)
 			signature := ed25519.Sign(m.dbscPriv, challenge)
+			
 			encodedSig := base64.StdEncoding.EncodeToString(signature)
 
 			m.SendAction(APIPayload{
@@ -216,33 +214,4 @@ func (m *MeshNode) listen() {
 			log.Printf("[SECURE_MESH] Ingress task written to DB. Action: %s", req.Action)
 		}
 	}
-}
-
-// Helper: Thread-safe, length-prefixed stream framing writer
-func (m *MeshNode) writeFramed(data []byte) error {
-	m.writeMu.Lock()
-	defer m.writeMu.Unlock()
-
-	length := uint32(len(data))
-	if err := binary.Write(m.stream, binary.BigEndian, length); err != nil {
-		return err
-	}
-
-	_, err := m.stream.Write(data)
-	return err
-}
-
-// Helper: Length-prefixed stream framing reader
-func (m *MeshNode) readFramed() ([]byte, error) {
-	var length uint32
-	if err := binary.Read(m.stream, binary.BigEndian, &length); err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(m.stream, buf); err != nil {
-		return nil, err
-	}
-
-	return buf, nil
 }
