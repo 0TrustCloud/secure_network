@@ -12,7 +12,6 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/gddisney/ultimate_db"
-	"github.com/hashicorp/yamux"
 	"github.com/quic-go/quic-go"
 )
 
@@ -24,7 +23,7 @@ const (
 
 type Gateway struct {
 	router         *Router
-	peerMesh       *PeerRoute
+	peerMesh       *PeerRoute // Assuming this is defined elsewhere in your package
 	cipher         noise.CipherSuite
 	sPriv          []byte
 	sPub           []byte
@@ -60,15 +59,7 @@ func (g *Gateway) ListenAndServe(port string, tlsConfig *tls.Config) error {
 }
 
 func (g *Gateway) HandleSecureStream(stream quic.Stream) {
-	hijacked := false
-
-	// If Yamux takes over the stream, we must NOT close it when this function exits.
-	// Yamux handles the lifecycle of hijacked streams.
-	defer func() {
-		if !hijacked {
-			stream.Close()
-		}
-	}()
+	defer stream.Close()
 
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   g.cipher,
@@ -115,9 +106,7 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	g.activeSessions.Store(sessionID, time.Now().Unix())
 
 	stopHeartbeat := make(chan struct{})
-	// The heartbeat routine will automatically stop when this function exits,
-	// which is exactly what we want if Yamux hijacks the stream.
-	defer close(stopHeartbeat) 
+	defer close(stopHeartbeat)
 	go g.monitorHeartbeat(stream, csSend, remoteKey, stopHeartbeat)
 
 	log.Printf("[GATEWAY] Secure Tunnel established for identity: %x", remoteKey[:8])
@@ -131,18 +120,15 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		if err != nil {
 			continue
 		}
-		
-		// If routeToAPI returns true, the stream has been hijacked for Yamux.
-		hijacked = g.routeToAPI(remoteKey, decrypted, stream)
-		if hijacked {
-			return // Exits the Noise read loop immediately. Yamux now owns the stream.
-		}
+		g.routeToAPI(remoteKey, decrypted)
 	}
 
 	g.activeSessions.Delete(sessionID)
 }
 
 func (g *Gateway) isIdentityValid(pubKey []byte) bool {
+	// Let the PolicyEngine decide based on DB blacklists and explicit PBAC permissions.
+	// Requires a baseline "network:connect" permission to establish a tunnel.
 	return g.router.PolicyEngine.HasPermission(pubKey, "network:connect")
 }
 
@@ -230,12 +216,11 @@ type Event struct {
 	Payload []byte
 }
 
-// Returns true if the stream is hijacked by a multiplexer
-func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) bool {
+func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
 		log.Printf("[GATEWAY] Invalid API payload from %x: %v", signer[:8], err)
-		return false
+		return
 	}
 
 	contextData := map[string]string{
@@ -249,7 +234,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 
 	if !g.router.PolicyEngine.Evaluate(signer, req.Action, resource, contextData) {
 		log.Printf("[SECURITY] Gateway blocked unauthorized action '%s' by %x", req.Action, signer[:8])
-		return false
+		return
 	}
 
 	txnID := g.router.DB.BeginTxn()
@@ -258,25 +243,6 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 	now := time.Now().Unix()
 
 	switch req.Action {
-	case "auth_connector":
-		log.Printf("[GATEWAY] Hardware & Policy Verified. Hijacking stream for Yamux tunnel: %s", req.Target)
-
-		yConf := yamux.DefaultConfig()
-		yConf.KeepAliveInterval = 30 * time.Second
-
-		session, err := yamux.Client(stream, yConf)
-		if err != nil {
-			log.Printf("[GATEWAY] Failed to establish Yamux multiplexer: %v", err)
-			return false
-		}
-
-		if existing, ok := g.router.ActiveTunnels.Load(req.Target); ok {
-			existing.(*yamux.Session).Close()
-		}
-		g.router.ActiveTunnels.Store(req.Target, session)
-
-		return true // Tell HandleSecureStream to break the read loop
-
 	case "dbsc_heartbeat_resp":
 		g.activeSessions.Store(string(signer), now)
 
@@ -291,13 +257,13 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 		err := g.router.DB.Write(ContentPageID, txnID, []byte(postID), val, 0)
 		if err != nil {
 			log.Printf("[GATEWAY] DB Write Failed (Post): %v", err)
-			return false
+			return
 		}
 		log.Printf("[GATEWAY] Post created by %x: %s", signer[:8], postID)
 
 	case "karma":
 		if req.Target == "" {
-			return false
+			return
 		}
 		karmaKey := fmt.Sprintf("karma:%s:%x", req.Target, signer[:8])
 		meta := ContentMeta{
@@ -314,7 +280,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 
 	case "share":
 		if req.Target == "" {
-			return false
+			return
 		}
 		shareKey := fmt.Sprintf("share:%s:%x", req.Target, signer[:8])
 		meta := ContentMeta{
@@ -332,7 +298,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 		var rpcPayload map[string]interface{}
 		if err := json.Unmarshal([]byte(req.Content), &rpcPayload); err != nil {
 			log.Printf("[GATEWAY] Invalid RPC content from %x: %v", signer[:8], err)
-			return false
+			return
 		}
 
 		rpcPayload["signer"] = signer
@@ -346,6 +312,4 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream quic.Stream) 
 	default:
 		log.Printf("[GATEWAY] Unknown action '%s' from %x", req.Action, signer[:8])
 	}
-	
-	return false
 }
