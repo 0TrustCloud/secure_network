@@ -5,8 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,23 +24,20 @@ const (
 	TaskPageID   ultimate_db.PageID = 100
 )
 
-// APIPayload representation matching your mesh structure
-type APIPayload struct {
-	Action  string `json:"action"`
-	Content string `json:"content"`
-}
+// NOTE: APIPayload has been removed from this file to prevent redeclaration 
+// conflicts since it is already defined in gateway.go.
 
 type MeshNode struct {
-	db         *ultimate_db.DB
-	noisePriv  []byte
-	noisePub   []byte
-	dbscPriv   ed25519.PrivateKey
-	gatePub    []byte
-	cipher     noise.CipherSuite
-	stream     quic.Stream
-	csSend     *noise.CipherState
-	csRecv     *noise.CipherState
-	writeMu    sync.Mutex // Protects concurrent writes to the QUIC stream
+	db        *ultimate_db.DB
+	noisePriv []byte
+	noisePub  []byte
+	dbscPriv  ed25519.PrivateKey
+	gatePub   []byte
+	cipher    noise.CipherSuite
+	stream    quic.Stream // Clean interface allocation (not a pointer-to-interface)
+	csSend    *noise.CipherState
+	csRecv    *noise.CipherState
+	writeMu   sync.Mutex  // Guards concurrent stream serialization
 }
 
 func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey, error) {
@@ -73,6 +70,14 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 	db.Write(ConfigPageID, txn, []byte("mesh_dbsc_priv"), []byte(dbscPriv), 0)
 
 	return kp.Private, kp.Public, dbscPriv, nil
+}
+
+func (m *MeshNode) GetNoisePubKey() []byte {
+	return m.noisePub
+}
+
+func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey {
+	return m.dbscPriv
 }
 
 func NewMeshNode(db *ultimate_db.DB, gatePub []byte) (*MeshNode, error) {
@@ -125,15 +130,15 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 		return fmt.Errorf("mesh write message failed: %w", err)
 	}
 
-	// Frame handshake message
-	if err := m.writeFramed(msg); err != nil {
-		return fmt.Errorf("mesh handshake send failed: %w", err)
+	// Frame and write the initial Noise handshake frame
+	if err = m.writeFramed(msg); err != nil {
+		return fmt.Errorf("mesh stream write failed: %w", err)
 	}
 
-	// Read framed handshake response
+	// Read and resolve the response handshake frame safely
 	respBuf, err := m.readFramed()
 	if err != nil {
-		return fmt.Errorf("mesh handshake response read failed: %w", err)
+		return fmt.Errorf("mesh stream read failed: %w", err)
 	}
 
 	if _, _, _, err = hs.ReadMessage(nil, respBuf); err != nil {
@@ -150,6 +155,7 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 }
 
 func (m *MeshNode) SendAction(payload APIPayload) error {
+	// Clean interface check against nil
 	if m.csSend == nil || m.stream == nil {
 		return fmt.Errorf("mesh tunnel is not established")
 	}
@@ -191,13 +197,10 @@ func (m *MeshNode) listen() {
 			signature := ed25519.Sign(m.dbscPriv, challenge)
 			encodedSig := base64.StdEncoding.EncodeToString(signature)
 
-			err := m.SendAction(APIPayload{
+			m.SendAction(APIPayload{
 				Action:  "dbsc_heartbeat_resp",
 				Content: encodedSig,
 			})
-			if err != nil {
-				log.Printf("[SECURE_MESH] Failed to send heartbeat response: %v", err)
-			}
 			continue
 		}
 
@@ -215,7 +218,7 @@ func (m *MeshNode) listen() {
 	}
 }
 
-// Helper: Thread-safe, length-prefixed protocol writing
+// Helper: Thread-safe, length-prefixed stream framing writer
 func (m *MeshNode) writeFramed(data []byte) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
@@ -229,7 +232,7 @@ func (m *MeshNode) writeFramed(data []byte) error {
 	return err
 }
 
-// Helper: Safe atomic message frame reader
+// Helper: Length-prefixed stream framing reader
 func (m *MeshNode) readFramed() ([]byte, error) {
 	var length uint32
 	if err := binary.Read(m.stream, binary.BigEndian, &length); err != nil {
