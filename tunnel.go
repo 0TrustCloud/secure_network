@@ -2,7 +2,7 @@ package secure_network
 
 import (
 	"context"
-	"crypto" // Added
+	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
@@ -25,7 +25,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// streamConn adapts a quic.Stream to the net.Conn interface for ReverseProxy
+// streamConn adapts a quic.Stream to the net.Conn interface for the ReverseProxy
 type streamConn struct {
 	quic.Stream
 	localAddr  net.Addr
@@ -38,14 +38,16 @@ func (s *streamConn) SetDeadline(t time.Time) error  { return nil }
 func (s *streamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (s *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 
+// TunnelAuthPayload bridges machine and human identities for secure overlay routing.
 type TunnelAuthPayload struct {
 	Subdomain    string `json:"subdomain"`
-	IdentityType string `json:"identity_type"`
-	Identifier   string `json:"identifier"`
-	Credential   string `json:"credential"`
-	Nonce        string `json:"nonce"`
+	IdentityType string `json:"identity_type"` // "machine" or "human"
+	Identifier   string `json:"identifier"`    // Service Name or Subject ID
+	Credential   string `json:"credential"`    // DBSC Base64 Sig OR Session Cookie
+	Nonce        string `json:"nonce"`         // Unix timestamp
 }
 
+// TunnelManager implements the Module interface
 type TunnelManager struct {
 	router     *Router
 	db         *ultimate_db.DB
@@ -55,14 +57,14 @@ type TunnelManager struct {
 	PublicPort string
 
 	mu      sync.RWMutex
-	tunnels map[string]quic.Connection
+	tunnels map[string]quic.Conn
 }
 
 func NewTunnelManager(publicPort string, sysLog *logger.LogDispatcher) *TunnelManager {
 	return &TunnelManager{
 		PublicPort: publicPort,
 		Logger:     sysLog,
-		tunnels:    make(map[string]quic.Connection),
+		tunnels:    make(map[string]quic.Conn),
 	}
 }
 
@@ -77,11 +79,15 @@ func (t *TunnelManager) Init(r *Router) error {
 }
 
 func (t *TunnelManager) Start() error {
+	if t.Logger != nil {
+		t.Logger.Info(fmt.Sprintf("Mesh Tunnel proxy online. Public Ingress: :%s", t.PublicPort))
+	}
 	go t.listenPublicHTTP()
 	return nil
 }
 
-func (t *TunnelManager) RegisterTunnel(conn quic.Connection, authMsg []byte) error {
+// RegisterTunnel is called by the Gateway to bind a QUIC connection to a subdomain.
+func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
 	var msg TunnelAuthPayload
 	if err := json.Unmarshal(authMsg, &msg); err != nil {
 		return fmt.Errorf("malformed tunnel auth payload")
@@ -89,16 +95,27 @@ func (t *TunnelManager) RegisterTunnel(conn quic.Connection, authMsg []byte) err
 
 	subjectID, err := t.authenticate(msg)
 	if err != nil {
+		if t.Logger != nil {
+			t.Logger.Audit(msg.Identifier, "TUNNEL_AUTH_FAILED", fmt.Sprintf("Rejected %s: %v", msg.Subdomain, err))
+		}
 		return err
 	}
 
-	if !t.pe.Evaluate([]byte(subjectID), "bind", "tunnel:"+msg.Subdomain, nil) {
-		return fmt.Errorf("forbidden")
+	resource := "tunnel:" + msg.Subdomain
+	if !t.pe.Evaluate([]byte(subjectID), "bind", resource, nil) {
+		return fmt.Errorf("forbidden by policy")
 	}
 
 	t.mu.Lock()
+	if existing, ok := t.tunnels[msg.Subdomain]; ok {
+		existing.CloseWithError(0, "Subdomain claimed by new session")
+	}
 	t.tunnels[msg.Subdomain] = conn
 	t.mu.Unlock()
+
+	if t.Logger != nil {
+		t.Logger.Audit(subjectID, "TUNNEL_ESTABLISHED", "Bound to "+msg.Subdomain)
+	}
 
 	go func() {
 		<-conn.Context().Done()
@@ -106,6 +123,7 @@ func (t *TunnelManager) RegisterTunnel(conn quic.Connection, authMsg []byte) err
 		delete(t.tunnels, msg.Subdomain)
 		t.mu.Unlock()
 	}()
+
 	return nil
 }
 
@@ -114,26 +132,40 @@ func (t *TunnelManager) authenticate(msg TunnelAuthPayload) (string, error) {
 		return t.sm.ValidateCookieToken(msg.Credential)
 	}
 
-	// Machine Auth
-	var timestamp int64
-	fmt.Sscanf(msg.Nonce, "%d", &timestamp)
-	
-	txn := t.db.BeginTxn()
-	userBytes, _ := t.db.Read(1, txn, []byte("user:"+msg.Identifier))
-	t.db.CommitTxn(txn)
-	
-	var user webauthnext.PasskeyUser
-	json.Unmarshal(userBytes, &user)
-	tpmPubKey, _ := tpm2.DecodePublic(user.ID)
-	cryptoKey, _ := tpmPubKey.Key()
-	
-	sig, _ := base64.StdEncoding.DecodeString(msg.Credential)
-	payloadHash := sha256.Sum256([]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)))
+	if msg.IdentityType == "machine" {
+		var timestamp int64
+		fmt.Sscanf(msg.Nonce, "%d", &timestamp)
+		if time.Now().Unix()-timestamp > 60 {
+			return "", fmt.Errorf("DBSC proof expired")
+		}
 
-	rsaKey := cryptoKey.(*rsa.PublicKey)
-	err := rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, payloadHash[:], sig)
-	if err != nil { return "", err }
-	return msg.Identifier, nil
+		txn := t.db.BeginTxn()
+		userBytes, err := t.db.Read(1, txn, []byte("user:"+msg.Identifier))
+		t.db.CommitTxn(txn)
+		if err != nil || len(userBytes) == 0 {
+			return "", fmt.Errorf("identity not found")
+		}
+
+		var user webauthnext.PasskeyUser
+		json.Unmarshal(userBytes, &user)
+
+		tpmPubKey, err := tpm2.DecodePublic(user.ID)
+		if err != nil { return "", err }
+
+		cryptoKey, err := tpmPubKey.Key()
+		if err != nil { return "", err }
+
+		sig, err := base64.StdEncoding.DecodeString(msg.Credential)
+		if err != nil { return "", err }
+
+		payloadHash := sha256.Sum256([]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)))
+
+		rsaKey := cryptoKey.(*rsa.PublicKey)
+		err = rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, payloadHash[:], sig)
+		if err != nil { return "", err }
+		return msg.Identifier, nil
+	}
+	return "", fmt.Errorf("unknown identity")
 }
 
 func (t *TunnelManager) listenPublicHTTP() {
@@ -164,6 +196,48 @@ func (t *TunnelManager) listenPublicHTTP() {
 	http.ListenAndServe(":"+t.PublicPort, proxy)
 }
 
+func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *tls.Config) error {
+	tlsConfig.NextProtos = []string{"secure-overlay"}
+	for {
+		conn, err := quic.DialAddr(ctx, cfg.GatewayAddr, tlsConfig, &quic.Config{KeepAlivePeriod: 30 * time.Second})
+		if err != nil { time.Sleep(5 * time.Second); continue }
+
+		stream, err := conn.OpenStreamSync(ctx)
+		if err != nil { conn.CloseWithError(0, ""); continue }
+
+		nonce := fmt.Sprintf("%d", time.Now().Unix())
+		msg := TunnelAuthPayload{
+			Subdomain: cfg.Subdomain, IdentityType: cfg.IdentityType, Identifier: cfg.Identifier, Nonce: nonce,
+		}
+
+		if cfg.IdentityType == "machine" && cfg.Signer != nil {
+			msg.Credential, _ = cfg.Signer(fmt.Sprintf("%s|%s", nonce, cfg.Subdomain))
+		} else {
+			msg.Credential = cfg.SessionToken
+		}
+
+		authBytes, _ := json.Marshal(msg)
+		reqBytes, _ := json.Marshal(map[string]string{"action": "tunnel_bind", "content": string(authBytes)})
+		stream.Write(reqBytes)
+
+		for {
+			incStream, err := conn.AcceptStream(ctx)
+			if err != nil { break }
+			go proxyStreamToLocal(incStream, cfg.LocalAddr)
+		}
+	}
+}
+
+type TunnelAgentConfig struct {
+	GatewayAddr  string
+	LocalAddr    string
+	Subdomain    string
+	IdentityType string
+	Identifier   string
+	SessionToken string
+	Signer       func(payload string) (string, error)
+}
+
 func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 	defer stream.Close()
 	local, err := net.Dial("tcp", localAddr)
@@ -172,8 +246,8 @@ func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// Explicitly cast to interface
-	go func() { defer wg.Done(); io.Copy(local, stream) }()
-	go func() { defer wg.Done(); io.Copy(stream, local) }()
+	// Cast stream to interface for io.Copy compatibility
+	go func() { defer wg.Done(); io.Copy(local, stream.(io.Reader)) }()
+	go func() { defer wg.Done(); io.Copy(stream.(io.Writer), local) }()
 	wg.Wait()
 }
