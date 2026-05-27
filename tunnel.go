@@ -25,7 +25,6 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// streamConn adapts a quic.Stream to the net.Conn interface for the ReverseProxy
 type streamConn struct {
 	quic.Stream
 	localAddr  net.Addr
@@ -38,16 +37,14 @@ func (s *streamConn) SetDeadline(t time.Time) error  { return nil }
 func (s *streamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (s *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// TunnelAuthPayload bridges machine and human identities for secure overlay routing.
 type TunnelAuthPayload struct {
 	Subdomain    string `json:"subdomain"`
-	IdentityType string `json:"identity_type"` // "machine" or "human"
-	Identifier   string `json:"identifier"`    // Service Name or Subject ID
-	Credential   string `json:"credential"`    // DBSC Base64 Sig OR Session Cookie
-	Nonce        string `json:"nonce"`         // Unix timestamp
+	IdentityType string `json:"identity_type"`
+	Identifier   string `json:"identifier"`
+	Credential   string `json:"credential"`
+	Nonce        string `json:"nonce"`
 }
 
-// TunnelManager implements the Module interface
 type TunnelManager struct {
 	router     *Router
 	db         *ultimate_db.DB
@@ -86,7 +83,6 @@ func (t *TunnelManager) Start() error {
 	return nil
 }
 
-// RegisterTunnel is called by the Gateway to bind a QUIC connection to a subdomain.
 func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
 	var msg TunnelAuthPayload
 	if err := json.Unmarshal(authMsg, &msg); err != nil {
@@ -95,15 +91,11 @@ func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
 
 	subjectID, err := t.authenticate(msg)
 	if err != nil {
-		if t.Logger != nil {
-			t.Logger.Audit(msg.Identifier, "TUNNEL_AUTH_FAILED", fmt.Sprintf("Rejected %s: %v", msg.Subdomain, err))
-		}
 		return err
 	}
 
-	resource := "tunnel:" + msg.Subdomain
-	if !t.pe.Evaluate([]byte(subjectID), "bind", resource, nil) {
-		return fmt.Errorf("forbidden by policy")
+	if !t.pe.Evaluate([]byte(subjectID), "bind", "tunnel:"+msg.Subdomain, nil) {
+		return fmt.Errorf("forbidden")
 	}
 
 	t.mu.Lock()
@@ -113,17 +105,12 @@ func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
 	t.tunnels[msg.Subdomain] = conn
 	t.mu.Unlock()
 
-	if t.Logger != nil {
-		t.Logger.Audit(subjectID, "TUNNEL_ESTABLISHED", "Bound to "+msg.Subdomain)
-	}
-
 	go func() {
 		<-conn.Context().Done()
 		t.mu.Lock()
 		delete(t.tunnels, msg.Subdomain)
 		t.mu.Unlock()
 	}()
-
 	return nil
 }
 
@@ -140,28 +127,19 @@ func (t *TunnelManager) authenticate(msg TunnelAuthPayload) (string, error) {
 		}
 
 		txn := t.db.BeginTxn()
-		userBytes, err := t.db.Read(1, txn, []byte("user:"+msg.Identifier))
+		userBytes, _ := t.db.Read(1, txn, []byte("user:"+msg.Identifier))
 		t.db.CommitTxn(txn)
-		if err != nil || len(userBytes) == 0 {
-			return "", fmt.Errorf("identity not found")
-		}
-
+		
 		var user webauthnext.PasskeyUser
 		json.Unmarshal(userBytes, &user)
-
-		tpmPubKey, err := tpm2.DecodePublic(user.ID)
-		if err != nil { return "", err }
-
-		cryptoKey, err := tpmPubKey.Key()
-		if err != nil { return "", err }
-
-		sig, err := base64.StdEncoding.DecodeString(msg.Credential)
-		if err != nil { return "", err }
-
+		tpmPubKey, _ := tpm2.DecodePublic(user.ID)
+		cryptoKey, _ := tpmPubKey.Key()
+		
+		sig, _ := base64.StdEncoding.DecodeString(msg.Credential)
 		payloadHash := sha256.Sum256([]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)))
 
 		rsaKey := cryptoKey.(*rsa.PublicKey)
-		err = rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, payloadHash[:], sig)
+		err := rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, payloadHash[:], sig)
 		if err != nil { return "", err }
 		return msg.Identifier, nil
 	}
@@ -186,8 +164,8 @@ func (t *TunnelManager) listenPublicHTTP() {
 				if err != nil { return nil, err }
 				
 				return &streamConn{
-					Stream:     stream, 
-					localAddr:  conn.LocalAddr(), 
+					Stream:     stream,
+					localAddr:  conn.LocalAddr(),
 					remoteAddr: conn.RemoteAddr(),
 				}, nil
 			},
@@ -196,18 +174,6 @@ func (t *TunnelManager) listenPublicHTTP() {
 	http.ListenAndServe(":"+t.PublicPort, proxy)
 }
 
-// TunnelAgentConfig defines connection parameters for the client side.
-type TunnelAgentConfig struct {
-	GatewayAddr  string
-	LocalAddr    string
-	Subdomain    string
-	IdentityType string
-	Identifier   string
-	SessionToken string
-	Signer       func(payload string) (string, error)
-}
-
-// RunMeshTunnelAgent connects the local application to the Aura Microkernel.
 func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *tls.Config) error {
 	tlsConfig.NextProtos = []string{"secure-overlay"}
 	for {
@@ -240,6 +206,16 @@ func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *t
 	}
 }
 
+type TunnelAgentConfig struct {
+	GatewayAddr  string
+	LocalAddr    string
+	Subdomain    string
+	IdentityType string
+	Identifier   string
+	SessionToken string
+	Signer       func(payload string) (string, error)
+}
+
 func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 	defer stream.Close()
 	local, err := net.Dial("tcp", localAddr)
@@ -248,8 +224,7 @@ func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// Cast stream to io interfaces to force satisfaction
-	go func() { defer wg.Done(); io.Copy(local, stream.(io.Reader)) }()
-	go func() { defer wg.Done(); io.Copy(stream.(io.Writer), local) }()
+	go func() { defer wg.Done(); io.Copy(local, stream) }()
+	go func() { defer wg.Done(); io.Copy(stream, local) }()
 	wg.Wait()
 }
