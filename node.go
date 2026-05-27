@@ -21,53 +21,40 @@ type EdgeNode struct {
 	Gateway        *Gateway
 	PolicyEngine   *secure_policy.PolicyEngine
 	SessionManager *secure_policy.SessionManager
-	Logger         *logger.LogDispatcher // Injected Logger
+	Logger         *logger.LogDispatcher 
 }
 
-// NewEdgeNode initializes the secure mesh node and propagates the LogDispatcher
 func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth *webauthnext.Provider, sysLogger *logger.LogDispatcher) (*EdgeNode, error) {
 	dm, err := ultimate_db.NewDiskManager(dbPath)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 
 	bp := ultimate_db.NewBufferPool(dm, 1024)
 	wal, err := ultimate_db.NewBatchingWAL(dbPath + "_wal.log")
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 
 	db := ultimate_db.NewDB(bp, wal)
 	ultimate_db.RecoverDB(dbPath+"_wal.log", db)
 
-	peerMesh := NewPeerRoute(db, auth, staticPrivKey)
-	
-	// Inject logger into GossipManager
+	peerMesh := NewPeerRoute(db, auth, staticPrivKey, sysLogger)
 	gossip := NewGossipManager(db, peerMesh, sysLogger)
 	peerMesh.SetIngressHandler(gossip.HandleIngress)
 
-	// Generate RSA key for Session Manager signing
 	sessionKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 
 	pe := secure_policy.NewPolicyEngine(db)
 	sm := secure_policy.NewSessionManager(db, sessionKey)
 
-	router, _ := NewRouter(db, nil, "secure_session_token", pe, sm)
+	// Injected sysLogger into the Router
+	router, err := NewRouter(db, nil, "secure_session_token", pe, sm, sysLogger)
+	if err != nil { return nil, err }
 
-	// Inject logger into key generation
 	noisePriv, noisePub, _, err := loadOrGenerateKeys(db, sysLogger)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 
-	// Inject logger into Gateway
 	gateway := NewGateway(router, peerMesh, noisePriv, noisePub, sysLogger)
 	peerMesh.SetGateway(gateway)
 
-	// Inject logger into RPC Manager
 	rpcEngine := NewRPCManager(peerMesh, sysLogger)
 	router.Attach(rpcEngine)
 
