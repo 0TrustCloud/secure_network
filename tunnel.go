@@ -19,7 +19,7 @@ import (
 
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http-3"
+	"github.com/quic-go/quic-go/http3"
 
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
