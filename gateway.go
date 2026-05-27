@@ -59,7 +59,9 @@ func (g *Gateway) ListenAndServe(port string, tlsConfig *tls.Config) error {
 	return nil
 }
 
-func (g *Gateway) HandleSecureStream(stream quic.Stream) {
+// HandleSecureStream now accepts the parent connection explicitly.
+// IMPORTANT: Ensure the listener that calls this passes both conn and stream.
+func (g *Gateway) HandleSecureStream(conn quic.Connection, stream quic.Stream) {
 	defer stream.Close()
 
 	hs, err := noise.NewHandshakeState(noise.Config{
@@ -93,7 +95,7 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 
 	if !g.isIdentityValid(remoteKey) {
 		if g.Logger != nil {
-			g.Logger.Audit("system_gateway", "TUNNEL_REJECTED", fmt.Sprintf("Revoked or unknown key attempted connection: %x", remoteKey[:8]))
+			g.Logger.Audit("system_gateway", "TUNNEL_REJECTED", fmt.Sprintf("Revoked or unknown key: %x", remoteKey[:8]))
 		}
 		return
 	}
@@ -128,24 +130,20 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 			continue
 		}
 
-		// Catch the Tunnel Bind immediately
+		// Tunnel Bind Interception
 		var req APIPayload
 		if err := json.Unmarshal(decrypted, &req); err == nil && req.Action == "tunnel_bind" {
 			if mod, exists := g.router.Modules["mesh_tunnel"]; exists {
 				tunnelManager := mod.(*TunnelManager)
 
-				// We pass the parent QUIC connection directly to the TunnelManager
-				// so it can open multiplexed HTTP streams.
-				if err := tunnelManager.RegisterTunnel(stream.Connection(), []byte(req.Content)); err != nil {
+				// FIXED: Passing 'conn' directly, avoiding the non-existent stream.Connection()
+				if err := tunnelManager.RegisterTunnel(conn, []byte(req.Content)); err != nil {
 					stream.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 				}
-				
-				// Exit the standard gateway loop. The TunnelManager now owns this connection.
 				return
 			}
 		}
 
-		// Fallback to standard API routing
 		g.routeToAPI(remoteKey, decrypted)
 	}
 
@@ -212,7 +210,7 @@ func (g *Gateway) ScrubbingCycle() {
 				g.router.DB.CommitTxn(txn)
 				
 				if g.Logger != nil {
-					g.Logger.Audit("system_scrubber", "REVOKE_DATA", fmt.Sprintf("Revoked data for identity: %x", meta.Signer[:8]))
+					g.Logger.Audit("system_scrubber", "REVOKE_DATA", fmt.Sprintf("Revoked: %x", meta.Signer[:8]))
 				}
 			}
 		}
@@ -252,7 +250,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 
 	if !g.router.PolicyEngine.Evaluate(signer, req.Action, resource, contextData) {
 		if g.Logger != nil {
-			g.Logger.Audit(fmt.Sprintf("%x", signer[:8]), "MESH_DENIED", "Gateway blocked unauthorized action: "+req.Action)
+			g.Logger.Audit(fmt.Sprintf("%x", signer[:8]), "MESH_DENIED", "Gateway blocked: "+req.Action)
 		}
 		return
 	}
@@ -275,9 +273,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 		}
 
 	case "karma":
-		if req.Target == "" {
-			return
-		}
+		if req.Target == "" { return }
 		karmaKey := fmt.Sprintf("karma:%s:%x", req.Target, signer[:8])
 		meta := ContentMeta{Signer: signer, Target: req.Target, Value: req.Value, CreatedAt: now}
 		val, _ := json.Marshal(meta)
