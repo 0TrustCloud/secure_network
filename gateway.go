@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/flynn/noise"
+	"github.com/gddisney/logger"
 	"github.com/gddisney/ultimate_db"
 	"github.com/quic-go/quic-go"
 )
@@ -23,21 +24,22 @@ const (
 
 type Gateway struct {
 	router         *Router
-	peerMesh       *PeerRoute // Assuming this is defined elsewhere in your package
+	peerMesh       *PeerRoute
 	cipher         noise.CipherSuite
 	sPriv          []byte
 	sPub           []byte
-
+	Logger         *logger.LogDispatcher
 	activeSessions sync.Map
 }
 
-func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte) *Gateway {
+func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte, sysLog *logger.LogDispatcher) *Gateway {
 	return &Gateway{
 		router:   r,
 		peerMesh: peerMesh,
 		cipher:   noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
 		sPriv:    sPriv,
 		sPub:     sPub,
+		Logger:   sysLog,
 	}
 }
 
@@ -63,13 +65,14 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   g.cipher,
-		Random:        nil,
 		Pattern:       noise.HandshakeIK,
 		Initiator:     false,
 		StaticKeypair: noise.DHKey{Private: g.sPriv, Public: g.sPub},
 	})
 	if err != nil {
-		log.Printf("[GATEWAY] Failed to initialize handshake state: %v", err)
+		if g.Logger != nil {
+			g.Logger.Error(fmt.Sprintf("Gateway handshake init failed: %v", err))
+		}
 		return
 	}
 
@@ -81,20 +84,23 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 
 	_, _, _, err = hs.ReadMessage(nil, buf[:n])
 	if err != nil {
-		log.Printf("[GATEWAY] Handshake failed: %v", err)
+		if g.Logger != nil {
+			g.Logger.Error(fmt.Sprintf("Gateway handshake failed: %v", err))
+		}
 		return
 	}
 
 	remoteKey := hs.PeerStatic()
 
 	if !g.isIdentityValid(remoteKey) {
-		log.Printf("[GATEWAY] Revoked or unknown key attempted connection. Dropping stream.")
+		if g.Logger != nil {
+			g.Logger.Audit("system_gateway", "TUNNEL_REJECTED", fmt.Sprintf("Revoked or unknown key attempted connection: %x", remoteKey[:8]))
+		}
 		return
 	}
 
 	respMsg, csSend, csRecv, err := hs.WriteMessage(nil, nil)
 	if err != nil {
-		log.Printf("[GATEWAY] Failed to complete handshake: %v", err)
 		return
 	}
 
@@ -109,7 +115,9 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	defer close(stopHeartbeat)
 	go g.monitorHeartbeat(stream, csSend, remoteKey, stopHeartbeat)
 
-	log.Printf("[GATEWAY] Secure Tunnel established for identity: %x", remoteKey[:8])
+	if g.Logger != nil {
+		g.Logger.Audit(fmt.Sprintf("%x", remoteKey[:8]), "TUNNEL_ESTABLISHED", "Secure QUIC tunnel established")
+	}
 
 	for {
 		n, err := stream.Read(buf)
@@ -127,8 +135,6 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 }
 
 func (g *Gateway) isIdentityValid(pubKey []byte) bool {
-	// Let the PolicyEngine decide based on DB blacklists and explicit PBAC permissions.
-	// Requires a baseline "network:connect" permission to establish a tunnel.
 	return g.router.PolicyEngine.HasPermission(pubKey, "network:connect")
 }
 
@@ -141,23 +147,18 @@ func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState
 		case <-ticker.C:
 			lastSeen, ok := g.activeSessions.Load(string(signer))
 			if !ok || time.Now().Unix()-lastSeen.(int64) > 180 {
-				log.Printf("[GATEWAY] Tunnel timed out for %x. Closing.", signer[:8])
+				if g.Logger != nil {
+					g.Logger.Info(fmt.Sprintf("Tunnel timed out for %x. Closing.", signer[:8]))
+				}
 				stream.Close()
 				return
 			}
-
 			challenge := make([]byte, 32)
 			rand.Read(challenge)
-
-			payload := APIPayload{
-				Action:  "dbsc_heartbeat_req",
-				Content: string(challenge),
-			}
-
+			payload := APIPayload{Action: "dbsc_heartbeat_req", Content: string(challenge)}
 			data, _ := json.Marshal(payload)
 			enc, _ := csSend.Encrypt(nil, nil, data)
 			stream.Write(enc)
-
 		case <-stop:
 			return
 		}
@@ -167,9 +168,11 @@ func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState
 func (g *Gateway) ScrubbingCycle() {
 	ticker := time.NewTicker(24 * time.Hour)
 	for range ticker.C {
-		log.Println("[CLEANUP] Starting global revocation scrub...")
 		if g.router.GUIKit == nil {
 			continue
+		}
+		if g.Logger != nil {
+			g.Logger.Info("Starting global revocation scrub...")
 		}
 
 		tree := ultimate_db.NewBTree(g.router.GUIKit.BP, 2)
@@ -189,7 +192,10 @@ func (g *Gateway) ScrubbingCycle() {
 				txn := g.router.DB.BeginTxn()
 				g.router.DB.Write(ContentPageID, txn, key, nil, time.Nanosecond)
 				g.router.DB.CommitTxn(txn)
-				log.Printf("[CLEANUP] Revoked data for identity: %x", meta.Signer[:8])
+				
+				if g.Logger != nil {
+					g.Logger.Audit("system_scrubber", "REVOKE_DATA", fmt.Sprintf("Revoked data for identity: %x", meta.Signer[:8]))
+				}
 			}
 		}
 		cursor.Close()
@@ -211,35 +217,30 @@ type ContentMeta struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-type Event struct {
-	Topic   string
-	Payload []byte
-}
-
 func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
-		log.Printf("[GATEWAY] Invalid API payload from %x: %v", signer[:8], err)
+		if g.Logger != nil {
+			g.Logger.Error(fmt.Sprintf("Invalid API payload from %x: %v", signer[:8], err))
+		}
 		return
 	}
 
-	contextData := map[string]string{
-		"target": req.Target,
-	}
-
+	contextData := map[string]string{"target": req.Target}
 	resource := req.Target
 	if resource == "" {
 		resource = "*"
 	}
 
 	if !g.router.PolicyEngine.Evaluate(signer, req.Action, resource, contextData) {
-		log.Printf("[SECURITY] Gateway blocked unauthorized action '%s' by %x", req.Action, signer[:8])
+		if g.Logger != nil {
+			g.Logger.Audit(fmt.Sprintf("%x", signer[:8]), "MESH_DENIED", "Gateway blocked unauthorized action: "+req.Action)
+		}
 		return
 	}
 
 	txnID := g.router.DB.BeginTxn()
 	defer g.router.DB.CommitTxn(txnID)
-
 	now := time.Now().Unix()
 
 	switch req.Action {
@@ -248,68 +249,30 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 
 	case "post":
 		postID := fmt.Sprintf("post:%d:%x", time.Now().UnixNano(), signer[:4])
-		meta := ContentMeta{
-			Signer:    signer,
-			Content:   req.Content,
-			CreatedAt: now,
-		}
+		meta := ContentMeta{Signer: signer, Content: req.Content, CreatedAt: now}
 		val, _ := json.Marshal(meta)
-		err := g.router.DB.Write(ContentPageID, txnID, []byte(postID), val, 0)
-		if err != nil {
-			log.Printf("[GATEWAY] DB Write Failed (Post): %v", err)
-			return
+		_ = g.router.DB.Write(ContentPageID, txnID, []byte(postID), val, 0)
+		if g.Logger != nil {
+			g.Logger.Info(fmt.Sprintf("Mesh Post created by %x: %s", signer[:8], postID))
 		}
-		log.Printf("[GATEWAY] Post created by %x: %s", signer[:8], postID)
 
 	case "karma":
 		if req.Target == "" {
 			return
 		}
 		karmaKey := fmt.Sprintf("karma:%s:%x", req.Target, signer[:8])
-		meta := ContentMeta{
-			Signer:    signer,
-			Target:    req.Target,
-			Value:     req.Value,
-			CreatedAt: now,
-		}
+		meta := ContentMeta{Signer: signer, Target: req.Target, Value: req.Value, CreatedAt: now}
 		val, _ := json.Marshal(meta)
-		err := g.router.DB.Write(StatsPageID, txnID, []byte(karmaKey), val, 0)
-		if err == nil {
-			log.Printf("[GATEWAY] Karma (%d) applied to %s by %x", req.Value, req.Target, signer[:8])
-		}
-
-	case "share":
-		if req.Target == "" {
-			return
-		}
-		shareKey := fmt.Sprintf("share:%s:%x", req.Target, signer[:8])
-		meta := ContentMeta{
-			Signer:    signer,
-			Target:    req.Target,
-			CreatedAt: now,
-		}
-		val, _ := json.Marshal(meta)
-		err := g.router.DB.Write(StatsPageID, txnID, []byte(shareKey), val, 0)
-		if err == nil {
-			log.Printf("[GATEWAY] Content %s shared by %x", req.Target, signer[:8])
+		_ = g.router.DB.Write(StatsPageID, txnID, []byte(karmaKey), val, 0)
+		if g.Logger != nil {
+			g.Logger.Info(fmt.Sprintf("Karma (%d) applied to %s by %x", req.Value, req.Target, signer[:8]))
 		}
 
 	case "rpc":
 		var rpcPayload map[string]interface{}
-		if err := json.Unmarshal([]byte(req.Content), &rpcPayload); err != nil {
-			log.Printf("[GATEWAY] Invalid RPC content from %x: %v", signer[:8], err)
-			return
-		}
-
+		json.Unmarshal([]byte(req.Content), &rpcPayload)
 		rpcPayload["signer"] = signer
 		enrichedPayload, _ := json.Marshal(rpcPayload)
-
-		g.router.LocalBus <- SystemEvent{
-			Topic:   "rpc_ingress",
-			Payload: enrichedPayload,
-		}
-
-	default:
-		log.Printf("[GATEWAY] Unknown action '%s' from %x", req.Action, signer[:8])
+		g.router.LocalBus <- SystemEvent{Topic: "rpc_ingress", Payload: enrichedPayload}
 	}
 }
