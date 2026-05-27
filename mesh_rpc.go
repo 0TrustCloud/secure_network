@@ -6,8 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sync"
+
+	"github.com/gddisney/logger"
 )
 
 // RPCPayload defines the envelope for our Mesh RPC traffic.
@@ -30,6 +31,7 @@ type RPCContext struct {
 type RPCManager struct {
 	router    *Router
 	peerRoute *PeerRoute
+	Logger    *logger.LogDispatcher // Injected Logger
 
 	methods map[string]func(ctx RPCContext, args []byte) (interface{}, error)
 	pending map[string]chan *RPCPayload
@@ -37,9 +39,10 @@ type RPCManager struct {
 }
 
 // NewRPCManager creates a new instance of the RPC engine.
-func NewRPCManager(pr *PeerRoute) *RPCManager {
+func NewRPCManager(pr *PeerRoute, sysLog *logger.LogDispatcher) *RPCManager {
 	return &RPCManager{
 		peerRoute: pr,
+		Logger:    sysLog,
 		methods:   make(map[string]func(RPCContext, []byte) (interface{}, error)),
 		pending:   make(map[string]chan *RPCPayload),
 	}
@@ -56,7 +59,9 @@ func (m *RPCManager) Init(r *Router) error {
 
 // Start satisfies the Module interface.
 func (m *RPCManager) Start() error {
-	log.Println("[RPC] Mesh RPC Engine online and listening to LocalBus")
+	if m.Logger != nil {
+		m.Logger.Info("Mesh RPC Engine online and listening to LocalBus")
+	}
 
 	// Listen for RPC events published by the Gateway
 	for event := range m.router.LocalBus {
@@ -83,6 +88,9 @@ func (m *RPCManager) Call(ctx context.Context, method string, args interface{}) 
 
 	argsBytes, err := json.Marshal(args)
 	if err != nil {
+		if m.Logger != nil {
+			m.Logger.Error(fmt.Sprintf("Failed to marshal RPC args for method '%s': %v", method, err))
+		}
 		return nil, fmt.Errorf("failed to marshal args: %w", err)
 	}
 
@@ -94,7 +102,7 @@ func (m *RPCManager) Call(ctx context.Context, method string, args interface{}) 
 	}
 
 	replyCh := make(chan *RPCPayload, 1)
-	
+
 	m.mu.Lock()
 	m.pending[reqID] = replyCh
 	m.mu.Unlock()
@@ -125,6 +133,9 @@ func (m *RPCManager) Call(ctx context.Context, method string, args interface{}) 
 		}
 		return reply, nil
 	case <-ctx.Done():
+		if m.Logger != nil {
+			m.Logger.Error(fmt.Sprintf("RPC Call timeout for method '%s'", method))
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -133,7 +144,9 @@ func (m *RPCManager) Call(ctx context.Context, method string, args interface{}) 
 func (m *RPCManager) handleIngress(payload []byte) {
 	var req RPCPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
-		log.Printf("[RPC] Malformed payload dropped: %v", err)
+		if m.Logger != nil {
+			m.Logger.Error(fmt.Sprintf("Malformed RPC payload dropped: %v", err))
+		}
 		return
 	}
 
@@ -160,15 +173,26 @@ func (m *RPCManager) handleIngress(payload []byte) {
 
 	if !exists {
 		reply.Error = fmt.Sprintf("method '%s' not found", req.Method)
+		if m.Logger != nil {
+			m.Logger.Error(fmt.Sprintf("RPC method '%s' requested by %x not found", req.Method, req.Signer[:8]))
+		}
 	} else {
 		// Inject the cryptographic identity established by the Noise tunnel
 		ctx := RPCContext{CallerID: req.Signer}
 		res, err := handler(ctx, req.Args)
 		if err != nil {
 			reply.Error = err.Error()
+			if m.Logger != nil {
+				m.Logger.Error(fmt.Sprintf("RPC method '%s' failed for %x: %v", req.Method, req.Signer[:8], err))
+			}
 		} else {
 			resBytes, _ := json.Marshal(res)
 			reply.Result = resBytes
+			
+			// Optional: Audit successful RPC execution if tracing is highly desired
+			// if m.Logger != nil {
+			// 	m.Logger.Info(fmt.Sprintf("Successfully executed RPC method '%s' for %x", req.Method, req.Signer[:8]))
+			// }
 		}
 	}
 
