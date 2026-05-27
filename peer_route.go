@@ -6,10 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
 	"time"
 
 	"github.com/flynn/noise"
+	"github.com/gddisney/logger"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
 )
@@ -51,15 +52,17 @@ type PeerRoute struct {
 	localID        NodeID
 	policies       map[NodeID]AccessLevel
 	ingressHandler IngressHandler
+	Logger         *logger.LogDispatcher // Injected Logger
 }
 
-func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte) *PeerRoute {
+func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte, sysLog *logger.LogDispatcher) *PeerRoute {
 	localHash := sha256.Sum256(hardwareKey)
 	return &PeerRoute{
 		db:       db,
 		auth:     auth,
 		localID:  localHash,
 		policies: make(map[NodeID]AccessLevel),
+		Logger:   sysLog,
 	}
 }
 
@@ -72,11 +75,15 @@ func (p *PeerRoute) SetIngressHandler(handler IngressHandler) {
 }
 
 func (p *PeerRoute) Listen(ctx context.Context) {
-	log.Println("[PEER MESH] Listening for incoming routing mesh connections...")
+	if p.Logger != nil {
+		p.Logger.Info("Listening for incoming routing mesh connections...")
+	}
 }
 
 func (p *PeerRoute) Broadcast(ctx context.Context, payload []byte) {
-	log.Printf("[PEER MESH] Broadcasting payload: %d bytes", len(payload))
+	if p.Logger != nil {
+		p.Logger.Debug(fmt.Sprintf("Broadcasting payload: %d bytes", len(payload)))
+	}
 }
 
 func (p *PeerRoute) SetAccessPolicy(remoteID NodeID, level AccessLevel) {
@@ -89,14 +96,23 @@ func (p *PeerRoute) EvaluateSwarmHandshake(remoteIdentity []byte, intent string)
 
 	level, exists := p.policies[remoteID]
 	if !exists {
+		if p.Logger != nil {
+			p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection rejected: no cryptographic access policy established")
+		}
 		return false, errors.New("connection rejected: no cryptographic access policy established")
 	}
 
 	switch level {
 	case Reject:
+		if p.Logger != nil {
+			p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection actively rejected by peer policy")
+		}
 		return false, errors.New("connection actively rejected by peer")
 	case ReadOnly:
 		if intent != "S2P_PULL" {
+			if p.Logger != nil {
+				p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection rejected: read-only policy strictly enforced against write intent")
+			}
 			return false, errors.New("connection rejected: read-only policy strictly enforced")
 		}
 		return true, nil
@@ -130,6 +146,11 @@ func (p *PeerRoute) PublishToSwarm(ctx context.Context, payload []byte) (NodeID,
 	defer p.db.CommitTxn(txn)
 
 	p.db.Write(CachePageID, txn, objID[:], objBytes, 72*time.Hour)
+	
+	if p.Logger != nil {
+		p.Logger.Info(fmt.Sprintf("Published object %x to swarm cache", objID[:8]))
+	}
+	
 	return objID, nil
 }
 
@@ -150,8 +171,11 @@ func (p *PeerRoute) RevokeObject(ctx context.Context, objID NodeID) error {
 	txn := p.db.BeginTxn()
 	defer p.db.CommitTxn(txn)
 
-	// Replaced p.db.Delete with a tombstone write leveraging the active GC
-	return p.db.Write(CachePageID, txn, objID[:], nil, time.Nanosecond)
+	err := p.db.Write(CachePageID, txn, objID[:], nil, time.Nanosecond)
+	if err == nil && p.Logger != nil {
+		p.Logger.Info(fmt.Sprintf("Revoked object %x from swarm cache", objID[:8]))
+	}
+	return err
 }
 
 func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry, error) {
@@ -161,13 +185,12 @@ func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry
 	prefix := []byte("dht_node:")
 	var closest []RoutingEntry
 
-	// Replaced p.db.PrefixScan with p.db.Scan utilizing the callback iterator pattern
 	err := p.db.Scan(SystemPageID, txn, prefix, func(key, value []byte) bool {
 		var entry RoutingEntry
 		if err := json.Unmarshal(value, &entry); err == nil {
 			closest = append(closest, entry)
 		}
-		return true // Return true to continue iterating through the B+ Tree
+		return true 
 	})
 
 	if err != nil {
@@ -193,6 +216,9 @@ func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry
 func (p *PeerRoute) UpdateRoutingTable(remoteID NodeID, address string, dbscProof []byte) error {
 	isValid, err := p.auth.VerifyAddressClaim(remoteID[:], address, dbscProof)
 	if err != nil || !isValid {
+		if p.Logger != nil {
+			p.Logger.Audit(fmt.Sprintf("%x", remoteID[:8]), "ROUTING_REJECTED", "Hardware verification failed for address claim")
+		}
 		return errors.New("hardware verification failed")
 	}
 
@@ -206,7 +232,11 @@ func (p *PeerRoute) UpdateRoutingTable(remoteID NodeID, address string, dbscProo
 	txn := p.db.BeginTxn()
 	defer p.db.CommitTxn(txn)
 
-	return p.db.Write(SystemPageID, txn, key, valBytes, 2*time.Hour)
+	err = p.db.Write(SystemPageID, txn, key, valBytes, 2*time.Hour)
+	if err == nil && p.Logger != nil {
+		p.Logger.Info(fmt.Sprintf("Routing table updated for node %x at %s", remoteID[:8], address))
+	}
+	return err
 }
 
 func xorDistance(a, b NodeID) NodeID {
