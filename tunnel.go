@@ -26,16 +26,30 @@ import (
 )
 
 type streamConn struct {
-	quic.Stream
+	*quic.Stream
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
 
-func (s *streamConn) LocalAddr() net.Addr            { return s.localAddr }
-func (s *streamConn) RemoteAddr() net.Addr           { return s.remoteAddr }
-func (s *streamConn) SetDeadline(t time.Time) error  { return nil }
-func (s *streamConn) SetReadDeadline(t time.Time) error  { return nil }
-func (s *streamConn) SetWriteDeadline(t time.Time) error { return nil }
+func (s *streamConn) LocalAddr() net.Addr {
+	return s.localAddr
+}
+
+func (s *streamConn) RemoteAddr() net.Addr {
+	return s.remoteAddr
+}
+
+func (s *streamConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (s *streamConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (s *streamConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
 
 type TunnelAuthPayload struct {
 	Subdomain    string `json:"subdomain"`
@@ -57,7 +71,10 @@ type TunnelManager struct {
 	tunnels map[string]quic.Conn
 }
 
-func NewTunnelManager(publicPort string, sysLog *logger.LogDispatcher) *TunnelManager {
+func NewTunnelManager(
+	publicPort string,
+	sysLog *logger.LogDispatcher,
+) *TunnelManager {
 	return &TunnelManager{
 		PublicPort: publicPort,
 		Logger:     sysLog,
@@ -65,7 +82,9 @@ func NewTunnelManager(publicPort string, sysLog *logger.LogDispatcher) *TunnelMa
 	}
 }
 
-func (t *TunnelManager) Name() string { return "mesh_tunnel" }
+func (t *TunnelManager) Name() string {
+	return "mesh_tunnel"
+}
 
 func (t *TunnelManager) Init(r *Router) error {
 	t.router = r
@@ -77,14 +96,26 @@ func (t *TunnelManager) Init(r *Router) error {
 
 func (t *TunnelManager) Start() error {
 	if t.Logger != nil {
-		t.Logger.Info(fmt.Sprintf("Mesh Tunnel proxy online. Public Ingress: :%s", t.PublicPort))
+		t.Logger.Info(
+			fmt.Sprintf(
+				"Mesh Tunnel proxy online. Public Ingress: :%s",
+				t.PublicPort,
+			),
+		)
 	}
+
 	go t.listenPublicHTTP()
+
 	return nil
 }
 
-func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
+func (t *TunnelManager) RegisterTunnel(
+	conn quic.Conn,
+	authMsg []byte,
+) error {
+
 	var msg TunnelAuthPayload
+
 	if err := json.Unmarshal(authMsg, &msg); err != nil {
 		return fmt.Errorf("malformed tunnel auth payload")
 	}
@@ -94,75 +125,150 @@ func (t *TunnelManager) RegisterTunnel(conn quic.Conn, authMsg []byte) error {
 		return err
 	}
 
-	if !t.pe.Evaluate([]byte(subjectID), "bind", "tunnel:"+msg.Subdomain, nil) {
+	if !t.pe.Evaluate(
+		[]byte(subjectID),
+		"bind",
+		"tunnel:"+msg.Subdomain,
+		nil,
+	) {
 		return fmt.Errorf("forbidden")
 	}
 
 	t.mu.Lock()
+
 	if existing, ok := t.tunnels[msg.Subdomain]; ok {
-		existing.CloseWithError(0, "Subdomain claimed by new session")
+		existing.CloseWithError(
+			0,
+			"subdomain claimed by new session",
+		)
 	}
+
 	t.tunnels[msg.Subdomain] = conn
+
 	t.mu.Unlock()
 
 	go func() {
 		<-conn.Context().Done()
+
 		t.mu.Lock()
 		delete(t.tunnels, msg.Subdomain)
 		t.mu.Unlock()
 	}()
+
 	return nil
 }
 
-func (t *TunnelManager) authenticate(msg TunnelAuthPayload) (string, error) {
+func (t *TunnelManager) authenticate(
+	msg TunnelAuthPayload,
+) (string, error) {
+
 	if msg.IdentityType == "human" {
 		return t.sm.ValidateCookieToken(msg.Credential)
 	}
 
 	if msg.IdentityType == "machine" {
+
 		var timestamp int64
+
 		fmt.Sscanf(msg.Nonce, "%d", &timestamp)
+
 		if time.Now().Unix()-timestamp > 60 {
 			return "", fmt.Errorf("DBSC proof expired")
 		}
 
 		txn := t.db.BeginTxn()
-		userBytes, _ := t.db.Read(1, txn, []byte("user:"+msg.Identifier))
-		t.db.CommitTxn(txn)
-		
-		var user webauthnext.PasskeyUser
-		json.Unmarshal(userBytes, &user)
-		tpmPubKey, _ := tpm2.DecodePublic(user.ID)
-		cryptoKey, _ := tpmPubKey.Key()
-		
-		sig, _ := base64.StdEncoding.DecodeString(msg.Credential)
-		payloadHash := sha256.Sum256([]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)))
 
-		rsaKey := cryptoKey.(*rsa.PublicKey)
-		err := rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, payloadHash[:], sig)
-		if err != nil { return "", err }
+		userBytes, _ := t.db.Read(
+			1,
+			txn,
+			[]byte("user:"+msg.Identifier),
+		)
+
+		t.db.CommitTxn(txn)
+
+		var user webauthnext.PasskeyUser
+
+		if err := json.Unmarshal(userBytes, &user); err != nil {
+			return "", err
+		}
+
+		tpmPubKey, err := tpm2.DecodePublic(user.ID)
+		if err != nil {
+			return "", err
+		}
+
+		cryptoKey, err := tpmPubKey.Key()
+		if err != nil {
+			return "", err
+		}
+
+		rsaKey, ok := cryptoKey.(*rsa.PublicKey)
+		if !ok {
+			return "", fmt.Errorf("invalid RSA public key")
+		}
+
+		sig, err := base64.StdEncoding.DecodeString(msg.Credential)
+		if err != nil {
+			return "", err
+		}
+
+		payloadHash := sha256.Sum256(
+			[]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)),
+		)
+
+		err = rsa.VerifyPKCS1v15(
+			rsaKey,
+			crypto.SHA256,
+			payloadHash[:],
+			sig,
+		)
+
+		if err != nil {
+			return "", err
+		}
+
 		return msg.Identifier, nil
 	}
+
 	return "", fmt.Errorf("unknown identity")
 }
 
 func (t *TunnelManager) listenPublicHTTP() {
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
+
 			req.URL.Scheme = "http"
 			req.URL.Host = req.Host
 		},
+
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				sub := strings.Split(addr, ".")[0]
+			DialContext: func(
+				ctx context.Context,
+				network string,
+				addr string,
+			) (net.Conn, error) {
+
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					host = addr
+				}
+
+				sub := strings.Split(host, ".")[0]
+
 				t.mu.RLock()
 				conn, ok := t.tunnels[sub]
 				t.mu.RUnlock()
-				if !ok { return nil, fmt.Errorf("offline") }
+
+				if !ok {
+					return nil, fmt.Errorf("tunnel offline")
+				}
 
 				stream, err := conn.OpenStreamSync(ctx)
-				if err != nil { return nil, err }
-				
+				if err != nil {
+					return nil, err
+				}
+
 				return &streamConn{
 					Stream:     stream,
 					localAddr:  conn.LocalAddr(),
@@ -171,38 +277,109 @@ func (t *TunnelManager) listenPublicHTTP() {
 			},
 		},
 	}
-	http.ListenAndServe(":"+t.PublicPort, proxy)
+
+	server := &http.Server{
+		Addr:    ":" + t.PublicPort,
+		Handler: proxy,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		if t.Logger != nil {
+			t.Logger.Error(err.Error())
+		}
+	}
 }
 
-func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *tls.Config) error {
+func RunMeshTunnelAgent(
+	ctx context.Context,
+	cfg TunnelAgentConfig,
+	tlsConfig *tls.Config,
+) error {
+
 	tlsConfig.NextProtos = []string{"secure-overlay"}
+
 	for {
-		conn, err := quic.DialAddr(ctx, cfg.GatewayAddr, tlsConfig, &quic.Config{KeepAlivePeriod: 30 * time.Second})
-		if err != nil { time.Sleep(5 * time.Second); continue }
+
+		conn, err := quic.DialAddr(
+			ctx,
+			cfg.GatewayAddr,
+			tlsConfig,
+			&quic.Config{
+				KeepAlivePeriod: 30 * time.Second,
+			},
+		)
+
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
 
 		stream, err := conn.OpenStreamSync(ctx)
-		if err != nil { conn.CloseWithError(0, ""); continue }
+		if err != nil {
+			conn.CloseWithError(0, "")
+			continue
+		}
 
 		nonce := fmt.Sprintf("%d", time.Now().Unix())
+
 		msg := TunnelAuthPayload{
-			Subdomain: cfg.Subdomain, IdentityType: cfg.IdentityType, Identifier: cfg.Identifier, Nonce: nonce,
+			Subdomain:    cfg.Subdomain,
+			IdentityType: cfg.IdentityType,
+			Identifier:   cfg.Identifier,
+			Nonce:        nonce,
 		}
 
 		if cfg.IdentityType == "machine" && cfg.Signer != nil {
-			msg.Credential, _ = cfg.Signer(fmt.Sprintf("%s|%s", nonce, cfg.Subdomain))
+
+			msg.Credential, err = cfg.Signer(
+				fmt.Sprintf("%s|%s", nonce, cfg.Subdomain),
+			)
+
+			if err != nil {
+				conn.CloseWithError(0, "signing failed")
+				continue
+			}
+
 		} else {
+
 			msg.Credential = cfg.SessionToken
 		}
 
-		authBytes, _ := json.Marshal(msg)
-		reqBytes, _ := json.Marshal(map[string]string{"action": "tunnel_bind", "content": string(authBytes)})
-		stream.Write(reqBytes)
+		authBytes, err := json.Marshal(msg)
+		if err != nil {
+			conn.CloseWithError(0, "marshal failed")
+			continue
+		}
+
+		reqBytes, err := json.Marshal(
+			map[string]string{
+				"action":  "tunnel_bind",
+				"content": string(authBytes),
+			},
+		)
+
+		if err != nil {
+			conn.CloseWithError(0, "marshal failed")
+			continue
+		}
+
+		_, err = stream.Write(reqBytes)
+		if err != nil {
+			conn.CloseWithError(0, "write failed")
+			continue
+		}
 
 		for {
+
 			incStream, err := conn.AcceptStream(ctx)
-			if err != nil { break }
+			if err != nil {
+				break
+			}
+
 			go proxyStreamToLocal(incStream, cfg.LocalAddr)
 		}
+
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -216,15 +393,33 @@ type TunnelAgentConfig struct {
 	Signer       func(payload string) (string, error)
 }
 
-func proxyStreamToLocal(stream quic.Stream, localAddr string) {
+func proxyStreamToLocal(
+	stream *quic.Stream,
+	localAddr string,
+) {
+
 	defer stream.Close()
+
 	local, err := net.Dial("tcp", localAddr)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
+
 	defer local.Close()
 
 	var wg sync.WaitGroup
+
 	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(local, stream) }()
-	go func() { defer wg.Done(); io.Copy(stream, local) }()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(local, stream)
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(stream, local)
+	}()
+
 	wg.Wait()
 }
