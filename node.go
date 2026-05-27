@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"log"
 
+	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
@@ -20,9 +21,11 @@ type EdgeNode struct {
 	Gateway        *Gateway
 	PolicyEngine   *secure_policy.PolicyEngine
 	SessionManager *secure_policy.SessionManager
+	Logger         *logger.LogDispatcher // Injected Logger
 }
 
-func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth *webauthnext.Provider) (*EdgeNode, error) {
+// NewEdgeNode initializes the secure mesh node and propagates the LogDispatcher
+func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth *webauthnext.Provider, sysLogger *logger.LogDispatcher) (*EdgeNode, error) {
 	dm, err := ultimate_db.NewDiskManager(dbPath)
 	if err != nil {
 		return nil, err
@@ -38,11 +41,12 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	ultimate_db.RecoverDB(dbPath+"_wal.log", db)
 
 	peerMesh := NewPeerRoute(db, auth, staticPrivKey)
-	gossip := NewGossipManager(db, peerMesh)
+	
+	// Inject logger into GossipManager
+	gossip := NewGossipManager(db, peerMesh, sysLogger)
 	peerMesh.SetIngressHandler(gossip.HandleIngress)
 
 	// Generate RSA key for Session Manager signing
-	// In production, this should ideally be loaded from disk or a secure enclave
 	sessionKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -51,18 +55,20 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	pe := secure_policy.NewPolicyEngine(db)
 	sm := secure_policy.NewSessionManager(db, sessionKey)
 
-	// Updated NewRouter call to include the PolicyEngine and SessionManager
 	router, _ := NewRouter(db, nil, "secure_session_token", pe, sm)
 
-	noisePriv, noisePub, _, err := loadOrGenerateKeys(db)
+	// Inject logger into key generation
+	noisePriv, noisePub, _, err := loadOrGenerateKeys(db, sysLogger)
 	if err != nil {
 		return nil, err
 	}
 
-	gateway := NewGateway(router, peerMesh, noisePriv, noisePub)
+	// Inject logger into Gateway
+	gateway := NewGateway(router, peerMesh, noisePriv, noisePub, sysLogger)
 	peerMesh.SetGateway(gateway)
 
-	rpcEngine := NewRPCManager(peerMesh)
+	// Inject logger into RPC Manager
+	rpcEngine := NewRPCManager(peerMesh, sysLogger)
 	router.Attach(rpcEngine)
 
 	return &EdgeNode{
@@ -73,11 +79,17 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 		Gateway:        gateway,
 		PolicyEngine:   pe,
 		SessionManager: sm,
+		Logger:         sysLogger,
 	}, nil
 }
 
 func (n *EdgeNode) Start(port string, tlsConfig *tls.Config) error {
-	log.Printf("Starting Zero-Trust Edge Node on port %s", port)
+	if n.Logger != nil {
+		n.Logger.Info("Starting Zero-Trust Edge Node on port " + port)
+	} else {
+		log.Printf("Starting Zero-Trust Edge Node on port %s", port)
+	}
+	
 	go n.PeerMesh.Listen(context.Background())
 	return n.Gateway.ListenAndServe(port, tlsConfig)
 }
