@@ -18,7 +18,7 @@ type GossipEnvelope struct {
 	Payload    []byte    `json:"payload"`
 	Signature  []byte    `json:"signature"`
 	Lamport    uint64    `json:"lamport"`
-	Origin     []byte    `json:"origin"`
+	Origin     []byte    `json:"origin,omitempty"`
 	ReceivedAt time.Time `json:"received_at"`
 }
 
@@ -119,6 +119,10 @@ func (gm *GossipManager) Publish(
 		return err
 	}
 
+	if gm.peerRoute == nil {
+		return nil
+	}
+
 	return gm.peerRoute.Broadcast(
 		ctx,
 		"gossip",
@@ -148,6 +152,7 @@ func (gm *GossipManager) HandleIngress(
 		if time.Since(ts) < time.Hour {
 
 			gm.mu.Unlock()
+
 			return nil
 		}
 	}
@@ -163,7 +168,10 @@ func (gm *GossipManager) HandleIngress(
 
 	gm.mu.Unlock()
 
-	if gm.serviceKeys != nil {
+	// Skip signature verification safely
+	// if DB or service key manager is unavailable
+	if gm.serviceKeys != nil &&
+		gm.serviceKeys.DB != nil {
 
 		valid := gm.serviceKeys.VerifySignature(
 			env.ServiceID,
@@ -199,7 +207,7 @@ func (gm *GossipManager) HandleIngress(
 
 		if gm.Logger != nil {
 
-			gm.Logger.Error(
+			gm.Logger.Info(
 				fmt.Sprintf(
 					"No gossip handler for %s",
 					env.ServiceID,
