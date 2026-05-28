@@ -2,99 +2,262 @@ package secure_network
 
 import (
 	"context"
-	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
 	"github.com/flynn/noise"
+	"github.com/gddisney/logger"
+	"github.com/gddisney/service_keys"
+	"github.com/gddisney/ultimate_db"
+	"github.com/gddisney/webauthnext"
+	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/quic-go/quic-go"
 )
 
-type Mesh struct {
-	conn quic.Conn
+const (
+	ConfigPageID ultimate_db.PageID = 99
+	TaskPageID   ultimate_db.PageID = 100
+
+	MaxFrameSize = 16 * 1024 * 1024
+)
+
+type MeshNode struct {
+	db *ultimate_db.DB
+
+	noisePriv []byte
+	noisePub  []byte
+
+	dbscPriv ed25519.PrivateKey
+	gatePub  []byte
 
 	cipher noise.CipherSuite
 
-	staticPriv []byte
-	staticPub  []byte
+	conn   quic.Conn
+	stream *quic.Stream
+
+	csSend *noise.CipherState
+	csRecv *noise.CipherState
+
+	writeMu sync.Mutex
+	readMu  sync.Mutex
+
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	rpc *RPCManager
 
-	sendCipher *noise.CipherState
-	recvCipher *noise.CipherState
+	serviceKeys *service_keys.ServiceKeyManager
 
-	sessionMutex sync.RWMutex
-
-	connected bool
+	Logger *logger.LogDispatcher
 }
 
-func NewMesh(
-	rpc *RPCManager,
-	staticPriv []byte,
-	staticPub []byte,
-) *Mesh {
+func loadOrGenerateKeys(
+	db *ultimate_db.DB,
+	sysLog *logger.LogDispatcher,
+) ([]byte, []byte, ed25519.PrivateKey, error) {
 
-	return &Mesh{
-		rpc: rpc,
+	txn := db.BeginTxn()
+	defer db.CommitTxn(txn)
 
-		staticPriv: staticPriv,
-		staticPub:  staticPub,
+	noisePriv, err1 := db.Read(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_noise_priv"),
+	)
 
-		cipher: noise.NewCipherSuite(
-			noise.DH25519,
-			noise.CipherAESGCM,
-			noise.HashSHA256,
-		),
+	noisePub, err2 := db.Read(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_noise_pub"),
+	)
+
+	dbscPrivRaw, err3 := db.Read(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_dbsc_priv"),
+	)
+
+	if err1 == nil &&
+		err2 == nil &&
+		err3 == nil {
+
+		return noisePriv,
+			noisePub,
+			ed25519.PrivateKey(dbscPrivRaw),
+			nil
 	}
+
+	if sysLog != nil {
+		sysLog.Info(
+			"No mesh identity found. Generating new node keys...",
+		)
+	}
+
+	cipher := noise.NewCipherSuite(
+		noise.DH25519,
+		noise.CipherAESGCM,
+		noise.HashSHA256,
+	)
+
+	kp, err := cipher.GenerateKeypair(rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	_, dbscPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if err := db.Write(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_noise_priv"),
+		kp.Private,
+		0,
+	); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if err := db.Write(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_noise_pub"),
+		kp.Public,
+		0,
+	); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if err := db.Write(
+		ConfigPageID,
+		txn,
+		[]byte("mesh_dbsc_priv"),
+		[]byte(dbscPriv),
+		0,
+	); err != nil {
+		return nil, nil, nil, err
+	}
+
+	return kp.Private,
+		kp.Public,
+		dbscPriv,
+		nil
 }
 
-func (m *Mesh) Connect(
-	addr string,
-	tlsConfig *tls.Config,
+func NewMeshNode(
+	db *ultimate_db.DB,
+	gatePub []byte,
+	skm *service_keys.ServiceKeyManager,
+	sysLog *logger.LogDispatcher,
+) (*MeshNode, error) {
+
+	nPriv,
+		nPub,
+		dPriv,
+		err := loadOrGenerateKeys(
+		db,
+		sysLog,
+	)
+
+	if err != nil {
+		return nil,
+			fmt.Errorf(
+				"failed to initialize mesh identity: %w",
+				err,
+			)
+	}
+
+	ctx, cancel := context.WithCancel(
+		context.Background(),
+	)
+
+	node := &MeshNode{
+		db:          db,
+		noisePriv:   nPriv,
+		noisePub:    nPub,
+		dbscPriv:    dPriv,
+		gatePub:     gatePub,
+		cipher:      noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
+		serviceKeys: skm,
+		Logger:      sysLog,
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+
+	return node, nil
+}
+
+func (m *MeshNode) SetRPCManager(
+	rpc *RPCManager,
+) {
+	m.rpc = rpc
+}
+
+func (m *MeshNode) GetNoisePubKey() []byte {
+	return m.noisePub
+}
+
+func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey {
+	return m.dbscPriv
+}
+
+func (m *MeshNode) Connect(
+	ctx context.Context,
+	gatewayAddr string,
 ) error {
 
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"secure-overlay"},
+	}
+
 	conn, err := quic.DialAddr(
-		context.Background(),
-		addr,
-		tlsConfig,
+		ctx,
+		gatewayAddr,
+		tlsConf,
 		nil,
 	)
 
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"mesh QUIC dial failed: %w",
+			err,
+		)
 	}
 
-	m.conn = conn
-
-	stream, err := conn.OpenStreamSync(
-		context.Background(),
-	)
-
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
+		conn.CloseWithError(0, "stream open failed")
 		return err
 	}
 
 	hs, err := noise.NewHandshakeState(
 		noise.Config{
 			CipherSuite: m.cipher,
+			Random:      rand.Reader,
 			Pattern:     noise.HandshakeIK,
 			Initiator:   true,
 			StaticKeypair: noise.DHKey{
-				Private: m.staticPriv,
-				Public:  m.staticPub,
+				Private: m.noisePriv,
+				Public:  m.noisePub,
 			},
+			PeerStatic: m.gatePub,
 		},
 	)
 
 	if err != nil {
+		conn.CloseWithError(0, "noise init failed")
 		return err
 	}
 
@@ -104,384 +267,419 @@ func (m *Mesh) Connect(
 	)
 
 	if err != nil {
+		conn.CloseWithError(0, "noise write failed")
 		return err
 	}
 
-	_, err = stream.Write(msg)
+	if err := writeFrame(stream, msg); err != nil {
+		conn.CloseWithError(0, "handshake send failed")
+		return err
+	}
 
+	resp, err := readFrame(stream)
 	if err != nil {
+		conn.CloseWithError(0, "handshake read failed")
 		return err
 	}
 
-	resp := make([]byte, 4096)
-
-	n, err := stream.Read(resp)
-
-	if err != nil {
-		return err
-	}
-
-	_, _, _, err = hs.ReadMessage(
+	if _, _, _, err := hs.ReadMessage(
 		nil,
-		resp[:n],
-	)
+		resp,
+	); err != nil {
 
-	if err != nil {
-		return err
+		conn.CloseWithError(0, "handshake rejected")
+		return fmt.Errorf(
+			"gateway rejected Noise handshake: %w",
+			err,
+		)
 	}
 
-	m.sendCipher = csSend
-	m.recvCipher = csRecv
+	m.conn = conn
+	m.stream = stream
+	m.csSend = csSend
+	m.csRecv = csRecv
 
-	m.connected = true
+	if m.Logger != nil {
+		m.Logger.Info(
+			fmt.Sprintf(
+				"Mesh overlay connected. Node: %x",
+				m.noisePub[:8],
+			),
+		)
+	}
 
-	go m.readLoop(stream)
+	go m.listenLoop()
 
 	return nil
 }
 
-func (m *Mesh) readLoop(
-	stream quic.Stream,
-) {
+func (m *MeshNode) Close() error {
 
-	buf := make([]byte, MaxFrameSize)
-
-	for {
-
-		n, err := stream.Read(buf)
-
-		if err != nil {
-			m.connected = false
-			return
-		}
-
-		decrypted, err := m.recvCipher.Decrypt(
-			nil,
-			nil,
-			buf[:n],
-		)
-
-		if err != nil {
-			continue
-		}
-
-		var envelope map[string]interface{}
-
-		if err := json.Unmarshal(
-			decrypted,
-			&envelope,
-		); err != nil {
-			continue
-		}
-
-		if action, ok := envelope["action"].(string); ok {
-
-			switch action {
-
-			case "heartbeat":
-
-				m.handleHeartbeat(
-					stream,
-				)
-
-				continue
-
-			case "signed_rpc":
-
-				payloadBase64, ok :=
-					envelope["payload"].(string)
-
-				if !ok {
-					continue
-				}
-
-				payload, err :=
-					base64.StdEncoding.DecodeString(
-						payloadBase64,
-					)
-
-				if err != nil {
-					continue
-				}
-
-				m.rpc.handleIngress(
-					context.Background(),
-					payload,
-				)
-
-				continue
-			}
-		}
-	}
-}
-
-func (m *Mesh) handleHeartbeat(
-	stream quic.Stream,
-) {
-
-	resp := map[string]interface{}{
-		"action": "heartbeat_ack",
-		"time":   time.Now().Unix(),
-	}
-
-	raw, _ := json.Marshal(resp)
-
-	enc, err := m.sendCipher.Encrypt(
-		nil,
-		nil,
-		raw,
-	)
-
-	if err != nil {
-		return
-	}
-
-	_, _ = stream.Write(enc)
-}
-
-func (m *Mesh) SendRPC(
-	payload []byte,
-) error {
-
-	if !m.connected {
-		return errors.New("mesh not connected")
-	}
-
-	stream, err := m.conn.OpenStreamSync(
-		context.Background(),
-	)
-
-	if err != nil {
-		return err
-	}
-
-	defer stream.Close()
-
-	envelope := map[string]interface{}{
-		"action": "signed_rpc",
-		"payload": base64.StdEncoding.EncodeToString(
-			payload,
-		),
-	}
-
-	raw, err := json.Marshal(envelope)
-
-	if err != nil {
-		return err
-	}
-
-	enc, err := m.sendCipher.Encrypt(
-		nil,
-		nil,
-		raw,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	_, err = stream.Write(enc)
-
-	return err
-}
-
-func (m *Mesh) VerifySignedPayload(
-	publicKey *rsa.PublicKey,
-	payload []byte,
-	signature []byte,
-) error {
-
-	hash := sha256.Sum256(payload)
-
-	return rsa.VerifyPKCS1v15(
-		publicKey,
-		crypto.SHA256,
-		hash[:],
-		signature,
-	)
-}
-
-func GenerateMeshNonce() string {
-
-	buf := make([]byte, 32)
-
-	_, _ = rand.Read(buf)
-
-	return base64.StdEncoding.EncodeToString(
-		buf,
-	)
-}
-
-func (m *Mesh) Disconnect() error {
-
-	m.connected = false
+	m.cancel()
 
 	if m.conn != nil {
 		return m.conn.CloseWithError(
 			0,
-			"disconnect",
+			"shutdown",
 		)
 	}
 
 	return nil
 }
 
-func (m *Mesh) IsConnected() bool {
-	return m.connected
-}
-
-func (m *Mesh) WaitForConnection(
-	timeout time.Duration,
+func (m *MeshNode) SendAction(
+	payload APIPayload,
 ) error {
 
-	start := time.Now()
+	if m.stream == nil ||
+		m.csSend == nil {
+
+		return fmt.Errorf(
+			"mesh tunnel not established",
+		)
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	encrypted, err := m.csSend.Encrypt(
+		nil,
+		nil,
+		data,
+	)
+
+	if err != nil {
+		return fmt.Errorf(
+			"noise encryption failed: %w",
+			err,
+		)
+	}
+
+	return writeFrame(
+		m.stream,
+		encrypted,
+	)
+}
+
+func (m *MeshNode) listenLoop() {
 
 	for {
 
-		if m.connected {
-			return nil
+		select {
+
+		case <-m.ctx.Done():
+			return
+
+		default:
 		}
 
-		if time.Since(start) > timeout {
-			return errors.New(
-				"connection timeout",
+		frame, err := readFrame(m.stream)
+		if err != nil {
+
+			if m.Logger != nil {
+				m.Logger.Error(
+					fmt.Sprintf(
+						"Mesh stream closed: %v",
+						err,
+					),
+				)
+			}
+
+			return
+		}
+
+		decrypted, err := m.csRecv.Decrypt(
+			nil,
+			nil,
+			frame,
+		)
+
+		if err != nil {
+
+			if m.Logger != nil {
+				m.Logger.Error(
+					fmt.Sprintf(
+						"Noise decrypt failed: %v",
+						err,
+					),
+				)
+			}
+
+			continue
+		}
+
+		var req APIPayload
+
+		if err := json.Unmarshal(
+			decrypted,
+			&req,
+		); err != nil {
+
+			continue
+		}
+
+		switch req.Action {
+
+		case "dbsc_heartbeat_req":
+
+			m.handleHeartbeat(
+				req.Content,
+			)
+
+		case "rpc":
+
+			if m.rpc != nil {
+
+				m.rpc.handleIngress(
+					[]byte(req.Content),
+				)
+			}
+
+		default:
+
+			m.persistTask(
+				req.Action,
+				decrypted,
+			)
+		}
+	}
+}
+
+func (m *MeshNode) handleHeartbeat(
+	challenge string,
+) {
+
+	signature := ed25519.Sign(
+		m.dbscPriv,
+		[]byte(challenge),
+	)
+
+	encodedSig := base64.StdEncoding.EncodeToString(
+		signature,
+	)
+
+	resp := APIPayload{
+		Action:  "dbsc_heartbeat_resp",
+		Content: encodedSig,
+	}
+
+	if err := m.SendAction(resp); err != nil {
+
+		if m.Logger != nil {
+			m.Logger.Error(
+				fmt.Sprintf(
+					"Failed heartbeat response: %v",
+					err,
+				),
+			)
+		}
+	}
+}
+
+func (m *MeshNode) persistTask(
+	action string,
+	payload []byte,
+) {
+
+	txn := m.db.BeginTxn()
+	defer m.db.CommitTxn(txn)
+
+	taskID := fmt.Sprintf(
+		"task:%d",
+		time.Now().UnixNano(),
+	)
+
+	err := m.db.Write(
+		TaskPageID,
+		txn,
+		[]byte(taskID),
+		payload,
+		0,
+	)
+
+	if err != nil {
+
+		if m.Logger != nil {
+			m.Logger.Error(
+				fmt.Sprintf(
+					"Failed task persistence: %v",
+					err,
+				),
 			)
 		}
 
-		time.Sleep(
-			100 * time.Millisecond,
+		return
+	}
+
+	if m.Logger != nil {
+		m.Logger.Info(
+			fmt.Sprintf(
+				"Ingress task persisted: %s",
+				action,
+			),
 		)
 	}
 }
 
-func (m *Mesh) SendHeartbeat() error {
+func (m *MeshNode) VerifyMachineIdentity(
+	serviceName string,
+	nonce string,
+	signatureBase64 string,
+	path string,
+) error {
 
-	if !m.connected {
-		return errors.New(
-			"mesh disconnected",
+	if m.serviceKeys == nil {
+		return fmt.Errorf(
+			"service key manager unavailable",
 		)
 	}
 
-	stream, err := m.conn.OpenStreamSync(
-		context.Background(),
+	txn := m.db.BeginTxn()
+
+	userBytes, err := m.db.Read(
+		webauthnext.AuthPageID,
+		txn,
+		[]byte("user:"+serviceName),
+	)
+
+	m.db.CommitTxn(txn)
+
+	if err != nil ||
+		len(userBytes) == 0 {
+
+		return fmt.Errorf(
+			"service identity not found",
+		)
+	}
+
+	var user webauthnext.PasskeyUser
+
+	if err := json.Unmarshal(
+		userBytes,
+		&user,
+	); err != nil {
+
+		return err
+	}
+
+	tpmPubKey, err := tpm2.DecodePublic(
+		user.ID,
 	)
 
 	if err != nil {
 		return err
 	}
 
-	defer stream.Close()
-
-	payload := map[string]interface{}{
-		"action": "heartbeat",
-		"time":   time.Now().Unix(),
-	}
-
-	raw, err := json.Marshal(payload)
-
+	cryptoKey, err := tpmPubKey.Key()
 	if err != nil {
 		return err
 	}
 
-	enc, err := m.sendCipher.Encrypt(
-		nil,
-		nil,
-		raw,
+	rsaPubKey, ok := cryptoKey.(*rsa.PublicKey)
+	if !ok {
+		return fmt.Errorf(
+			"unsupported TPM key type",
+		)
+	}
+
+	signature, err := base64.StdEncoding.DecodeString(
+		signatureBase64,
 	)
 
 	if err != nil {
 		return err
 	}
 
-	_, err = stream.Write(enc)
+	payload := fmt.Sprintf(
+		"%s|%s",
+		nonce,
+		path,
+	)
+
+	payloadHash := sha256.Sum256(
+		[]byte(payload),
+	)
+
+	return rsa.VerifyPKCS1v15(
+		rsaPubKey,
+		crypto.SHA256,
+		payloadHash[:],
+		signature,
+	)
+}
+
+func writeFrame(
+	w io.Writer,
+	data []byte,
+) error {
+
+	if len(data) > MaxFrameSize {
+		return fmt.Errorf(
+			"frame exceeds max size",
+		)
+	}
+
+	header := make([]byte, 4)
+
+	binary.BigEndian.PutUint32(
+		header,
+		uint32(len(data)),
+	)
+
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
+
+	_, err := w.Write(data)
 
 	return err
 }
 
-func (m *Mesh) SecureBroadcast(
-	payload []byte,
-	privateKey *rsa.PrivateKey,
+func readFrame(
+	r io.Reader,
 ) ([]byte, error) {
 
-	hash := sha256.Sum256(payload)
+	header := make([]byte, 4)
 
-	signature, err := rsa.SignPKCS1v15(
-		rand.Reader,
-		privateKey,
-		crypto.SHA256,
-		hash[:],
-	)
+	if _, err := io.ReadFull(
+		r,
+		header,
+	); err != nil {
 
-	if err != nil {
 		return nil, err
 	}
 
-	packet := map[string]interface{}{
-		"payload": base64.StdEncoding.EncodeToString(
-			payload,
-		),
-		"signature": base64.StdEncoding.EncodeToString(
-			signature,
-		),
-		"timestamp": time.Now().Unix(),
-	}
-
-	return json.Marshal(packet)
-}
-
-func (m *Mesh) ValidateBroadcast(
-	publicKey *rsa.PublicKey,
-	packet []byte,
-) error {
-
-	var parsed map[string]interface{}
-
-	if err := json.Unmarshal(
-		packet,
-		&parsed,
-	); err != nil {
-		return err
-	}
-
-	payloadEncoded, ok :=
-		parsed["payload"].(string)
-
-	if !ok {
-		return errors.New(
-			"missing payload",
-		)
-	}
-
-	signatureEncoded, ok :=
-		parsed["signature"].(string)
-
-	if !ok {
-		return errors.New(
-			"missing signature",
-		)
-	}
-
-	payload, err :=
-		base64.StdEncoding.DecodeString(
-			payloadEncoded,
-		)
-
-	if err != nil {
-		return err
-	}
-
-	signature, err :=
-		base64.StdEncoding.DecodeString(
-			signatureEncoded,
-		)
-
-	if err != nil {
-		return err
-	}
-
-	return m.VerifySignedPayload(
-		publicKey,
-		payload,
-		signature,
+	size := binary.BigEndian.Uint32(
+		header,
 	)
+
+	if size == 0 {
+		return nil,
+			fmt.Errorf("empty frame")
+	}
+
+	if size > MaxFrameSize {
+		return nil,
+			fmt.Errorf(
+				"frame too large: %d",
+				size,
+			)
+	}
+
+	payload := make([]byte, size)
+
+	if _, err := io.ReadFull(
+		r,
+		payload,
+	); err != nil {
+
+		return nil, err
+	}
+
+	return payload, nil
 }
