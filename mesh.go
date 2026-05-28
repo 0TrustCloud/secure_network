@@ -2,6 +2,7 @@ package secure_network
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -27,8 +28,6 @@ import (
 const (
 	ConfigPageID ultimate_db.PageID = 99
 	TaskPageID   ultimate_db.PageID = 100
-
-	MaxFrameSize = 16 * 1024 * 1024
 )
 
 type MeshNode struct {
@@ -42,7 +41,7 @@ type MeshNode struct {
 
 	cipher noise.CipherSuite
 
-	conn   quic.Conn
+	conn   *quic.Conn
 	stream *quic.Stream
 
 	csSend *noise.CipherState
@@ -271,12 +270,16 @@ func (m *MeshNode) Connect(
 		return err
 	}
 
-	if err := writeFrame(stream, msg); err != nil {
+	if err := WriteFrame(stream, msg); err != nil {
 		conn.CloseWithError(0, "handshake send failed")
 		return err
 	}
 
-	resp, err := readFrame(stream)
+	resp, err := ReadFrame(
+		stream,
+		MaxFrameSize,
+	)
+
 	if err != nil {
 		conn.CloseWithError(0, "handshake read failed")
 		return err
@@ -288,14 +291,15 @@ func (m *MeshNode) Connect(
 	); err != nil {
 
 		conn.CloseWithError(0, "handshake rejected")
+
 		return fmt.Errorf(
 			"gateway rejected Noise handshake: %w",
 			err,
 		)
 	}
 
-	m.conn = conn
-	m.stream = stream
+	m.conn = &conn
+	m.stream = &stream
 	m.csSend = csSend
 	m.csRecv = csRecv
 
@@ -318,7 +322,7 @@ func (m *MeshNode) Close() error {
 	m.cancel()
 
 	if m.conn != nil {
-		return m.conn.CloseWithError(
+		return (*m.conn).CloseWithError(
 			0,
 			"shutdown",
 		)
@@ -360,8 +364,8 @@ func (m *MeshNode) SendAction(
 		)
 	}
 
-	return writeFrame(
-		m.stream,
+	return WriteFrame(
+		*m.stream,
 		encrypted,
 	)
 }
@@ -378,7 +382,11 @@ func (m *MeshNode) listenLoop() {
 		default:
 		}
 
-		frame, err := readFrame(m.stream)
+		frame, err := ReadFrame(
+			*m.stream,
+			MaxFrameSize,
+		)
+
 		if err != nil {
 
 			if m.Logger != nil {
@@ -436,16 +444,10 @@ func (m *MeshNode) listenLoop() {
 			if m.rpc != nil {
 
 				m.rpc.handleIngress(
+					context.Background(),
 					[]byte(req.Content),
 				)
 			}
-
-		default:
-
-			m.persistTask(
-				req.Action,
-				decrypted,
-			)
 		}
 	}
 }
@@ -454,52 +456,15 @@ func (m *MeshNode) handleHeartbeat(
 	challenge string,
 ) {
 
-	signature := ed25519.Sign(
-		m.dbscPriv,
+	hash := sha256.Sum256(
 		[]byte(challenge),
 	)
 
-	encodedSig := base64.StdEncoding.EncodeToString(
-		signature,
-	)
-
-	resp := APIPayload{
-		Action:  "dbsc_heartbeat_resp",
-		Content: encodedSig,
-	}
-
-	if err := m.SendAction(resp); err != nil {
-
-		if m.Logger != nil {
-			m.Logger.Error(
-				fmt.Sprintf(
-					"Failed heartbeat response: %v",
-					err,
-				),
-			)
-		}
-	}
-}
-
-func (m *MeshNode) persistTask(
-	action string,
-	payload []byte,
-) {
-
-	txn := m.db.BeginTxn()
-	defer m.db.CommitTxn(txn)
-
-	taskID := fmt.Sprintf(
-		"task:%d",
-		time.Now().UnixNano(),
-	)
-
-	err := m.db.Write(
-		TaskPageID,
-		txn,
-		[]byte(taskID),
-		payload,
-		0,
+	sig, err := rsa.SignPKCS1v15(
+		rand.Reader,
+		nil,
+		crypto.SHA256,
+		hash[:],
 	)
 
 	if err != nil {
@@ -507,7 +472,7 @@ func (m *MeshNode) persistTask(
 		if m.Logger != nil {
 			m.Logger.Error(
 				fmt.Sprintf(
-					"Failed task persistence: %v",
+					"Heartbeat signing failed: %v",
 					err,
 				),
 			)
@@ -516,45 +481,34 @@ func (m *MeshNode) persistTask(
 		return
 	}
 
-	if m.Logger != nil {
-		m.Logger.Info(
-			fmt.Sprintf(
-				"Ingress task persisted: %s",
-				action,
-			),
-		)
+	payload := APIPayload{
+		Action: "dbsc_heartbeat_resp",
+		Content: base64.StdEncoding.EncodeToString(
+			sig,
+		),
 	}
+
+	_ = m.SendAction(payload)
 }
 
 func (m *MeshNode) VerifyMachineIdentity(
-	serviceName string,
+	username string,
 	nonce string,
-	signatureBase64 string,
-	path string,
+	signature string,
+	scope string,
 ) error {
 
-	if m.serviceKeys == nil {
-		return fmt.Errorf(
-			"service key manager unavailable",
-		)
-	}
-
 	txn := m.db.BeginTxn()
+	defer m.db.CommitTxn(txn)
 
 	userBytes, err := m.db.Read(
-		webauthnext.AuthPageID,
+		IdentityPageID,
 		txn,
-		[]byte("user:"+serviceName),
+		[]byte("user:"+username),
 	)
 
-	m.db.CommitTxn(txn)
-
-	if err != nil ||
-		len(userBytes) == 0 {
-
-		return fmt.Errorf(
-			"service identity not found",
-		)
+	if err != nil {
+		return err
 	}
 
 	var user webauthnext.PasskeyUser
@@ -563,7 +517,6 @@ func (m *MeshNode) VerifyMachineIdentity(
 		userBytes,
 		&user,
 	); err != nil {
-
 		return err
 	}
 
@@ -580,106 +533,102 @@ func (m *MeshNode) VerifyMachineIdentity(
 		return err
 	}
 
-	rsaPubKey, ok := cryptoKey.(*rsa.PublicKey)
+	rsaKey, ok := cryptoKey.(*rsa.PublicKey)
 	if !ok {
-		return fmt.Errorf(
-			"unsupported TPM key type",
-		)
+		return fmt.Errorf("invalid RSA public key")
 	}
 
-	signature, err := base64.StdEncoding.DecodeString(
-		signatureBase64,
+	sigBytes, err := base64.StdEncoding.DecodeString(
+		signature,
 	)
 
 	if err != nil {
 		return err
 	}
 
-	payload := fmt.Sprintf(
-		"%s|%s",
-		nonce,
-		path,
-	)
-
-	payloadHash := sha256.Sum256(
-		[]byte(payload),
+	hash := sha256.Sum256(
+		[]byte(
+			fmt.Sprintf(
+				"%s|%s",
+				nonce,
+				scope,
+			),
+		),
 	)
 
 	return rsa.VerifyPKCS1v15(
-		rsaPubKey,
+		rsaKey,
 		crypto.SHA256,
-		payloadHash[:],
-		signature,
+		hash[:],
+		sigBytes,
 	)
 }
 
-func writeFrame(
+func WriteFrame(
 	w io.Writer,
-	data []byte,
+	payload []byte,
 ) error {
 
-	if len(data) > MaxFrameSize {
-		return fmt.Errorf(
-			"frame exceeds max size",
-		)
-	}
+	size := uint32(len(payload))
 
-	header := make([]byte, 4)
+	var hdr [4]byte
 
 	binary.BigEndian.PutUint32(
-		header,
-		uint32(len(data)),
+		hdr[:],
+		size,
 	)
 
-	if _, err := w.Write(header); err != nil {
+	if _, err := w.Write(
+		hdr[:],
+	); err != nil {
+
 		return err
 	}
 
-	_, err := w.Write(data)
+	_, err := w.Write(payload)
 
 	return err
 }
 
-func readFrame(
+func ReadFrame(
 	r io.Reader,
+	maxSize uint32,
 ) ([]byte, error) {
 
-	header := make([]byte, 4)
+	var hdr [4]byte
 
 	if _, err := io.ReadFull(
 		r,
-		header,
+		hdr[:],
 	); err != nil {
 
 		return nil, err
 	}
 
 	size := binary.BigEndian.Uint32(
-		header,
+		hdr[:],
 	)
 
 	if size == 0 {
 		return nil,
-			fmt.Errorf("empty frame")
-	}
-
-	if size > MaxFrameSize {
-		return nil,
 			fmt.Errorf(
-				"frame too large: %d",
-				size,
+				"empty frame",
 			)
 	}
 
-	payload := make([]byte, size)
-
-	if _, err := io.ReadFull(
-		r,
-		payload,
-	); err != nil {
-
-		return nil, err
+	if size > maxSize {
+		return nil,
+			fmt.Errorf(
+				"frame exceeds max size",
+			)
 	}
 
-	return payload, nil
+	buf := make([]byte, size)
+
+	_, err := io.ReadFull(
+		r,
+		buf,
+	)
+
+	return buf, err
 }
