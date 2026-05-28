@@ -2,7 +2,6 @@ package secure_network
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,55 +16,77 @@ import (
 )
 
 const (
-	AuthPageID           = 1
-	GossipPageID         = 3
-	MaxGossipPayloadSize = 1 << 20 // 1MB
-	MaxReplayWindow      = 60
+	AuthPageID ultimate_db.PageID = 1
+
+	DefaultGossipTTL       = 5 * time.Minute
+	MaxGossipPayloadSize   = 2 * 1024 * 1024
+	GossipReplayWindowSize = 4096
 )
 
+// GossipFrame is replicated across the secure mesh.
 type GossipFrame struct {
 	Key         string `json:"k"`
 	Value       []byte `json:"v"`
 	LamportTime uint64 `json:"lt"`
 
+	// Service identity.
 	ServiceID string `json:"sid"`
-	Timestamp int64  `json:"ts"`
 
+	// Signed timestamp nonce.
+	Nonce int64 `json:"nonce"`
+
+	// DBSC / TPM-backed signature.
 	Signature string `json:"sig"`
+
+	// Optional metadata.
+	ContentType string `json:"ct,omitempty"`
+	ShardID     uint64 `json:"shard_id,omitempty"`
 }
 
+// GossipManager handles distributed replicated state.
 type GossipManager struct {
-	db          *ultimate_db.DB
-	router      *PeerRoute
-	ServiceKeys *service_keys.ServiceKeyManager
-	Logger      *logger.LogDispatcher
+	db     *ultimate_db.DB
+	router *PeerRoute
+
+	serviceKeys *service_keys.ServiceKeyManager
+
+	Logger *logger.LogDispatcher
 
 	clock uint64
 
 	framePool *sync.Pool
+
+	replayMu sync.Mutex
+	replays  map[string]int64
 }
 
+// NewGossipManager initializes the gossip subsystem.
 func NewGossipManager(
 	db *ultimate_db.DB,
 	router *PeerRoute,
-	serviceKeyMgr *service_keys.ServiceKeyManager,
+	serviceKeyManager *service_keys.ServiceKeyManager,
 	sysLog *logger.LogDispatcher,
 ) *GossipManager {
 
-	return &GossipManager{
+	gm := &GossipManager{
 		db:          db,
 		router:      router,
-		ServiceKeys: serviceKeyMgr,
+		serviceKeys: serviceKeyManager,
 		Logger:      sysLog,
-
+		replays:     make(map[string]int64),
 		framePool: &sync.Pool{
 			New: func() interface{} {
 				return &GossipFrame{}
 			},
 		},
 	}
+
+	go gm.cleanupReplayCache()
+
+	return gm
 }
 
+// Tick advances Lamport clock.
 func (gm *GossipManager) Tick() uint64 {
 	return atomic.AddUint64(
 		&gm.clock,
@@ -73,20 +94,9 @@ func (gm *GossipManager) Tick() uint64 {
 	)
 }
 
-func (gm *GossipManager) resetFrame(
-	frame *GossipFrame,
-) {
-
-	frame.Key = ""
-	frame.Value = nil
-	frame.LamportTime = 0
-	frame.ServiceID = ""
-	frame.Timestamp = 0
-	frame.Signature = ""
-}
-
+// updateClock synchronizes Lamport time.
 func (gm *GossipManager) updateClock(
-	incomingTime uint64,
+	incoming uint64,
 ) {
 
 	for {
@@ -95,14 +105,14 @@ func (gm *GossipManager) updateClock(
 			&gm.clock,
 		)
 
-		if current >= incomingTime {
+		if current >= incoming {
 			break
 		}
 
 		if atomic.CompareAndSwapUint64(
 			&gm.clock,
 			current,
-			incomingTime,
+			incoming,
 		) {
 			break
 		}
@@ -114,59 +124,53 @@ func (gm *GossipManager) updateClock(
 	)
 }
 
-func (gm *GossipManager) createSignaturePayload(
-	frame *GossipFrame,
-) []byte {
-
-	return []byte(
-		fmt.Sprintf(
-			"%s|%x|%d|%d|%s",
-			frame.Key,
-			frame.Value,
-			frame.LamportTime,
-			frame.Timestamp,
-			frame.ServiceID,
-		),
-	)
-}
-
+// BroadcastStateChange sends signed state update.
 func (gm *GossipManager) BroadcastStateChange(
 	ctx context.Context,
 	key string,
 	value []byte,
 	serviceID string,
-	signature []byte,
+	signer func(string) (string, error),
 ) error {
 
-	if len(value) > MaxGossipPayloadSize {
-
+	if key == "" {
 		return errors.New(
-			"payload exceeds gossip limit",
+			"gossip key required",
 		)
 	}
 
-	frame := gm.framePool.Get().(*GossipFrame)
-	gm.resetFrame(frame)
+	if len(value) > MaxGossipPayloadSize {
+		return fmt.Errorf(
+			"gossip payload exceeds limit",
+		)
+	}
 
-	defer func() {
+	if signer == nil {
+		return errors.New(
+			"service signer required",
+		)
+	}
 
-		gm.resetFrame(frame)
-		gm.framePool.Put(frame)
+	frame := gm.framePool.Get().
+		(*GossipFrame)
 
-	}()
+	defer gm.framePool.Put(frame)
+
+	now := time.Now().Unix()
 
 	frame.Key = key
 	frame.Value = value
 	frame.LamportTime = gm.Tick()
 	frame.ServiceID = serviceID
-	frame.Timestamp = time.Now().Unix()
+	frame.Nonce = now
+	frame.ContentType = "application/octet-stream"
 
-	frame.Signature = base64.StdEncoding.EncodeToString(
-		signature,
+	signingPayload := gm.buildSigningPayload(
+		frame,
 	)
 
-	payload, err := json.Marshal(
-		frame,
+	sig, err := signer(
+		signingPayload,
 	)
 
 	if err != nil {
@@ -175,7 +179,45 @@ func (gm *GossipManager) BroadcastStateChange(
 
 			gm.Logger.Error(
 				fmt.Sprintf(
-					"Failed marshaling gossip frame: %v",
+					"Gossip signing failed: %v",
+					err,
+				),
+			)
+		}
+
+		return err
+	}
+
+	frame.Signature = sig
+
+	payload, err := json.Marshal(frame)
+	if err != nil {
+
+		if gm.Logger != nil {
+
+			gm.Logger.Error(
+				fmt.Sprintf(
+					"Failed to marshal gossip frame: %v",
+					err,
+				),
+			)
+		}
+
+		return err
+	}
+
+	err = gm.router.Broadcast(
+		ctx,
+		payload,
+	)
+
+	if err != nil {
+
+		if gm.Logger != nil {
+
+			gm.Logger.Error(
+				fmt.Sprintf(
+					"Gossip broadcast failed: %v",
 					err,
 				),
 			)
@@ -186,93 +228,29 @@ func (gm *GossipManager) BroadcastStateChange(
 
 	if gm.Logger != nil {
 
-		gm.Logger.Debug(
+		gm.Logger.Info(
 			fmt.Sprintf(
-				"Gossip broadcast [%s] from [%s]",
+				"Gossip broadcast committed [%s]",
 				key,
-				serviceID,
 			),
 		)
-	}
-
-	return gm.router.Broadcast(
-		ctx,
-		payload,
-	)
-}
-
-func (gm *GossipManager) verifyFrame(
-	frame *GossipFrame,
-) error {
-
-	if frame.ServiceID == "" {
-
-		return errors.New(
-			"missing service identity",
-		)
-	}
-
-	if frame.Signature == "" {
-
-		return errors.New(
-			"missing gossip signature",
-		)
-	}
-
-	if time.Now().Unix()-frame.Timestamp >
-		MaxReplayWindow {
-
-		return errors.New(
-			"gossip frame expired",
-		)
-	}
-
-	signature, err := base64.StdEncoding.DecodeString(
-		frame.Signature,
-	)
-
-	if err != nil {
-
-		return errors.New(
-			"invalid signature encoding",
-		)
-	}
-
-	payload := gm.createSignaturePayload(
-		frame,
-	)
-
-	err = gm.ServiceKeys.VerifySignedPayload(
-		frame.ServiceID,
-		payload,
-		signature,
-	)
-
-	if err != nil {
-
-		if gm.Logger != nil {
-
-			gm.Logger.Audit(
-				frame.ServiceID,
-				"GOSSIP_REJECTED",
-				fmt.Sprintf(
-					"Signature verification failed: %v",
-					err,
-				),
-			)
-		}
-
-		return err
 	}
 
 	return nil
 }
 
+// HandleIngress processes encrypted gossip frames.
 func (gm *GossipManager) HandleIngress(
 	ctx context.Context,
 	encryptedPayload []byte,
 	peerNoiseState *noise.CipherState,
 ) error {
+
+	if peerNoiseState == nil {
+		return errors.New(
+			"missing noise cipher state",
+		)
+	}
 
 	payload, err := peerNoiseState.Decrypt(
 		nil,
@@ -285,7 +263,7 @@ func (gm *GossipManager) HandleIngress(
 		if gm.Logger != nil {
 
 			gm.Logger.Error(
-				"Gossip payload decryption failed",
+				"Gossip decrypt failed",
 			)
 		}
 
@@ -298,26 +276,24 @@ func (gm *GossipManager) HandleIngress(
 
 		if gm.Logger != nil {
 
-			gm.Logger.Audit(
-				"system_gossip",
-				"GOSSIP_REJECTED",
-				"Payload exceeded maximum size",
+			gm.Logger.Error(
+				"Gossip payload exceeds limit",
 			)
 		}
 
 		return errors.New(
-			"payload exceeds maximum size",
+			"payload exceeds limit",
 		)
 	}
 
-	frame := gm.framePool.Get().(*GossipFrame)
-	gm.resetFrame(frame)
+	frame := gm.framePool.Get().
+		(*GossipFrame)
 
 	defer func() {
 
-		gm.resetFrame(frame)
-		gm.framePool.Put(frame)
+		*frame = GossipFrame{}
 
+		gm.framePool.Put(frame)
 	}()
 
 	if err := json.Unmarshal(
@@ -338,9 +314,59 @@ func (gm *GossipManager) HandleIngress(
 		return err
 	}
 
-	if err := gm.verifyFrame(
+	if frame.Key == "" {
+		return errors.New(
+			"missing gossip key",
+		)
+	}
+
+	// Replay protection.
+	if gm.isReplay(frame) {
+
+		if gm.Logger != nil {
+
+			gm.Logger.Audit(
+				frame.ServiceID,
+				"GOSSIP_REPLAY_BLOCKED",
+				frame.Key,
+			)
+		}
+
+		return errors.New(
+			"replay detected",
+		)
+	}
+
+	// Expiration protection.
+	if time.Now().Unix()-frame.Nonce > int64(DefaultGossipTTL.Seconds()) {
+
+		if gm.Logger != nil {
+
+			gm.Logger.Audit(
+				frame.ServiceID,
+				"GOSSIP_EXPIRED",
+				frame.Key,
+			)
+		}
+
+		return errors.New(
+			"gossip frame expired",
+		)
+	}
+
+	// Verify TPM-backed service identity.
+	if err := gm.verifyServiceFrame(
 		frame,
 	); err != nil {
+
+		if gm.Logger != nil {
+
+			gm.Logger.Audit(
+				frame.ServiceID,
+				"GOSSIP_AUTH_FAILED",
+				err.Error(),
+			)
+		}
 
 		return err
 	}
@@ -352,7 +378,7 @@ func (gm *GossipManager) HandleIngress(
 	writeTxn := gm.db.BeginTxn()
 
 	err = gm.db.Write(
-		GossipPageID,
+		AuthPageID,
 		writeTxn,
 		[]byte(frame.Key),
 		frame.Value,
@@ -367,7 +393,7 @@ func (gm *GossipManager) HandleIngress(
 
 			gm.Logger.Error(
 				fmt.Sprintf(
-					"Gossip DB sync failed: %v",
+					"Gossip DB write failed: %v",
 					err,
 				),
 			)
@@ -380,9 +406,8 @@ func (gm *GossipManager) HandleIngress(
 
 		gm.Logger.Info(
 			fmt.Sprintf(
-				"Gossip synchronized [%s] @ Lamport=%d from [%s]",
+				"Gossip synchronized [%s] from %s",
 				frame.Key,
-				frame.LamportTime,
 				frame.ServiceID,
 			),
 		)
@@ -391,9 +416,121 @@ func (gm *GossipManager) HandleIngress(
 	return nil
 }
 
-func (gm *GossipManager) CurrentLamportTime() uint64 {
+// verifyServiceFrame validates DBSC-backed frame signature.
+func (gm *GossipManager) verifyServiceFrame(
+	frame *GossipFrame,
+) error {
 
-	return atomic.LoadUint64(
-		&gm.clock,
+	if gm.serviceKeys == nil {
+		return errors.New(
+			"service key manager unavailable",
+		)
+	}
+
+	if frame.ServiceID == "" {
+		return errors.New(
+			"missing service identity",
+		)
+	}
+
+	if frame.Signature == "" {
+		return errors.New(
+			"missing gossip signature",
+		)
+	}
+
+	// Reuse your ServiceKeyManager verifier.
+	payload := gm.buildSigningPayload(
+		frame,
 	)
+
+	err := gm.serviceKeys.VerifyDetachedSignature(
+		frame.ServiceID,
+		payload,
+		frame.Signature,
+	)
+
+	if err != nil {
+
+		return fmt.Errorf(
+			"service signature invalid: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
+// buildSigningPayload creates canonical payload.
+func (gm *GossipManager) buildSigningPayload(
+	frame *GossipFrame,
+) string {
+
+	return fmt.Sprintf(
+		"%s|%d|%d|%d",
+		frame.Key,
+		len(frame.Value),
+		frame.LamportTime,
+		frame.Nonce,
+	)
+}
+
+// Replay prevention.
+func (gm *GossipManager) isReplay(
+	frame *GossipFrame,
+) bool {
+
+	replayKey := fmt.Sprintf(
+		"%s:%d:%d",
+		frame.ServiceID,
+		frame.LamportTime,
+		frame.Nonce,
+	)
+
+	gm.replayMu.Lock()
+	defer gm.replayMu.Unlock()
+
+	if _, exists := gm.replays[replayKey]; exists {
+		return true
+	}
+
+	gm.replays[replayKey] = time.Now().Unix()
+
+	if len(gm.replays) > GossipReplayWindowSize {
+
+		for k := range gm.replays {
+			delete(gm.replays, k)
+			break
+		}
+	}
+
+	return false
+}
+
+// cleanupReplayCache prevents unbounded growth.
+func (gm *GossipManager) cleanupReplayCache() {
+
+	ticker := time.NewTicker(
+		5 * time.Minute,
+	)
+
+	defer ticker.Stop()
+
+	for range ticker.C {
+
+		cutoff := time.Now().
+			Add(-DefaultGossipTTL).
+			Unix()
+
+		gm.replayMu.Lock()
+
+		for k, ts := range gm.replays {
+
+			if ts < cutoff {
+				delete(gm.replays, k)
+			}
+		}
+
+		gm.replayMu.Unlock()
+	}
 }
