@@ -1,113 +1,214 @@
 package secure_network
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
-	"github.com/flynn/noise"
 	"github.com/gddisney/logger"
-	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
+	"github.com/gddisney/service_keys"
 )
 
 const (
-	SystemPageID ultimate_db.PageID = 1
-	CachePageID  ultimate_db.PageID = 2
+	DefaultPeerWriteTimeout = 10 * time.Second
+	DefaultPeerReadTimeout  = 30 * time.Second
+	DefaultPeerQueueSize    = 1024
 )
 
-type AccessLevel int
+type PeerMessage struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	From      string `json:"from"`
+	Target    string `json:"target,omitempty"`
+	Timestamp int64  `json:"timestamp"`
 
-const (
-	Reject AccessLevel = iota
-	ReadOnly
-	See
-)
+	Payload []byte `json:"payload"`
 
-type NodeID [32]byte
+	ServiceName string `json:"service_name,omitempty"`
+	Nonce       string `json:"nonce,omitempty"`
+	Proof       string `json:"proof,omitempty"`
 
-type SwarmObject struct {
-	ObjectID  NodeID    `json:"object_id"`
-	OwnerID   NodeID    `json:"owner_id"`
-	Payload   []byte    `json:"payload"`
-	Signature []byte    `json:"signature"`
-	CreatedAt time.Time `json:"created_at"`
+	Signature string `json:"signature,omitempty"`
 }
 
-type RoutingEntry struct {
-	ID        NodeID    `json:"id"`
-	Address   string    `json:"address"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
+type PeerSession struct {
+	ID string
 
-type IngressHandler func(
-	context.Context,
-	[]byte,
-	*noise.CipherState,
-) error
+	Node *MeshNode
+
+	LastSeen int64
+
+	SendQueue chan []byte
+}
 
 type PeerRoute struct {
-	db             *ultimate_db.DB
-	gateway        *Gateway
-	auth           *webauthnext.Provider
-	localID        NodeID
-	ingressHandler IngressHandler
+	node *MeshNode
 
-	policies   map[NodeID]AccessLevel
-	policiesMu sync.RWMutex
+	serviceKeys *service_keys.ServiceKeyManager
 
 	Logger *logger.LogDispatcher
+
+	mu sync.RWMutex
+
+	peers map[string]*PeerSession
+
+	handlers map[string]func(
+		context.Context,
+		*PeerMessage,
+	) error
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	wg sync.WaitGroup
 }
 
 func NewPeerRoute(
-	db *ultimate_db.DB,
-	auth *webauthnext.Provider,
-	hardwareKey []byte,
+	node *MeshNode,
+	skm *service_keys.ServiceKeyManager,
 	sysLog *logger.LogDispatcher,
 ) *PeerRoute {
 
-	localHash := sha256.Sum256(hardwareKey)
+	ctx, cancel := context.WithCancel(
+		context.Background(),
+	)
 
 	return &PeerRoute{
-		db:       db,
-		auth:     auth,
-		localID:  localHash,
-		policies: make(map[NodeID]AccessLevel),
-		Logger:   sysLog,
+		node:        node,
+		serviceKeys: skm,
+		Logger:      sysLog,
+		peers:       make(map[string]*PeerSession),
+		handlers: make(
+			map[string]func(
+				context.Context,
+				*PeerMessage,
+			) error,
+		),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
-func (p *PeerRoute) SetGateway(g *Gateway) {
-	p.gateway = g
+func (p *PeerRoute) Start() {
+
+	p.startOnce.Do(func() {
+
+		if p.Logger != nil {
+			p.Logger.Info(
+				"PeerRoute overlay online",
+			)
+		}
+
+		p.wg.Add(1)
+
+		go p.reaperLoop()
+	})
 }
 
-func (p *PeerRoute) SetIngressHandler(
-	handler IngressHandler,
-) {
-	p.ingressHandler = handler
+func (p *PeerRoute) Stop() {
+
+	p.stopOnce.Do(func() {
+
+		p.cancel()
+
+		p.mu.Lock()
+
+		for _, peer := range p.peers {
+			close(peer.SendQueue)
+		}
+
+		p.peers = map[string]*PeerSession{}
+
+		p.mu.Unlock()
+
+		p.wg.Wait()
+	})
 }
 
-func (p *PeerRoute) Listen(
-	ctx context.Context,
+func (p *PeerRoute) RegisterHandler(
+	messageType string,
+	handler func(
+		context.Context,
+		*PeerMessage,
+	) error,
 ) {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.handlers[messageType] = handler
+}
+
+func (p *PeerRoute) AddPeer(
+	peerID string,
+	node *MeshNode,
+) {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if existing, ok := p.peers[peerID]; ok {
+
+		existing.LastSeen = time.Now().Unix()
+
+		return
+	}
+
+	session := &PeerSession{
+		ID:        peerID,
+		Node:      node,
+		LastSeen:  time.Now().Unix(),
+		SendQueue: make(chan []byte, DefaultPeerQueueSize),
+	}
+
+	p.peers[peerID] = session
+
+	p.wg.Add(1)
+
+	go p.peerWriteLoop(session)
 
 	if p.Logger != nil {
+
 		p.Logger.Info(
-			"PeerRoute listener active",
+			fmt.Sprintf(
+				"Peer connected: %s",
+				peerID,
+			),
 		)
 	}
+}
 
-	<-ctx.Done()
+func (p *PeerRoute) RemovePeer(
+	peerID string,
+) {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	peer, ok := p.peers[peerID]
+	if !ok {
+		return
+	}
+
+	close(peer.SendQueue)
+
+	delete(p.peers, peerID)
 
 	if p.Logger != nil {
+
 		p.Logger.Info(
-			"PeerRoute listener shutting down",
+			fmt.Sprintf(
+				"Peer removed: %s",
+				peerID,
+			),
 		)
 	}
 }
@@ -115,470 +216,440 @@ func (p *PeerRoute) Listen(
 func (p *PeerRoute) Broadcast(
 	ctx context.Context,
 	payload []byte,
-) {
+) error {
+
+	msg := &PeerMessage{
+		ID:        generatePeerMessageID(),
+		Type:      "broadcast",
+		From:      base64.StdEncoding.EncodeToString(p.node.noisePub),
+		Timestamp: time.Now().UnixNano(),
+		Payload:   payload,
+	}
+
+	return p.broadcastMessage(
+		ctx,
+		msg,
+	)
+}
+
+func (p *PeerRoute) SendToPeer(
+	ctx context.Context,
+	peerID string,
+	payload []byte,
+) error {
+
+	msg := &PeerMessage{
+		ID:        generatePeerMessageID(),
+		Type:      "direct",
+		From:      base64.StdEncoding.EncodeToString(p.node.noisePub),
+		Target:    peerID,
+		Timestamp: time.Now().UnixNano(),
+		Payload:   payload,
+	}
+
+	return p.sendMessageToPeer(
+		ctx,
+		peerID,
+		msg,
+	)
+}
+
+func (p *PeerRoute) BroadcastSigned(
+	ctx context.Context,
+	serviceName string,
+	payload []byte,
+) error {
+
+	nonce := fmt.Sprintf(
+		"%d",
+		time.Now().UnixNano(),
+	)
+
+	signature := ed25519.Sign(
+		p.node.dbscPriv,
+		[]byte(nonce),
+	)
+
+	msg := &PeerMessage{
+		ID:          generatePeerMessageID(),
+		Type:        "signed_broadcast",
+		From:        base64.StdEncoding.EncodeToString(p.node.noisePub),
+		Timestamp:   time.Now().UnixNano(),
+		Payload:     payload,
+		ServiceName: serviceName,
+		Nonce:       nonce,
+		Proof: base64.StdEncoding.EncodeToString(
+			signature,
+		),
+	}
+
+	return p.broadcastMessage(
+		ctx,
+		msg,
+	)
+}
+
+func (p *PeerRoute) HandleIngress(
+	ctx context.Context,
+	raw []byte,
+) error {
+
+	var msg PeerMessage
+
+	if err := json.Unmarshal(
+		raw,
+		&msg,
+	); err != nil {
+
+		return fmt.Errorf(
+			"peer message decode failed: %w",
+			err,
+		)
+	}
+
+	if err := p.validateMessage(
+		&msg,
+	); err != nil {
+
+		if p.Logger != nil {
+
+			p.Logger.Audit(
+				"peer_route",
+				"PEER_REJECTED",
+				err.Error(),
+			)
+		}
+
+		return err
+	}
+
+	p.mu.RLock()
+
+	handler, ok := p.handlers[msg.Type]
+
+	p.mu.RUnlock()
+
+	if ok {
+
+		return handler(
+			ctx,
+			&msg,
+		)
+	}
 
 	if p.Logger != nil {
 
-		p.Logger.Debug(
+		p.Logger.Info(
 			fmt.Sprintf(
-				"Broadcasting payload (%d bytes)",
-				len(payload),
+				"No handler for peer message type: %s",
+				msg.Type,
 			),
 		)
 	}
 
-	if p.gateway != nil {
+	return nil
+}
 
-		if broadcaster, ok := any(p.gateway).(interface {
-			Broadcast(context.Context, []byte) error
-		}); ok {
+func (p *PeerRoute) validateMessage(
+	msg *PeerMessage,
+) error {
 
-			if err := broadcaster.Broadcast(
-				ctx,
-				payload,
-			); err != nil {
+	if msg.ID == "" {
+		return fmt.Errorf(
+			"missing message id",
+		)
+	}
+
+	if msg.Timestamp == 0 {
+		return fmt.Errorf(
+			"missing timestamp",
+		)
+	}
+
+	if len(msg.Payload) == 0 {
+		return fmt.Errorf(
+			"empty payload",
+		)
+	}
+
+	if time.Since(
+		time.Unix(0, msg.Timestamp),
+	) > 5*time.Minute {
+
+		return fmt.Errorf(
+			"stale peer message",
+		)
+	}
+
+	if msg.ServiceName != "" {
+
+		if p.serviceKeys == nil {
+
+			return fmt.Errorf(
+				"service key layer unavailable",
+			)
+		}
+
+		if msg.Nonce == "" ||
+			msg.Proof == "" {
+
+			return fmt.Errorf(
+				"missing service proof",
+			)
+		}
+
+		err := p.node.VerifyMachineIdentity(
+			msg.ServiceName,
+			msg.Nonce,
+			msg.Proof,
+			"/mesh/peer",
+		)
+
+		if err != nil {
+
+			return fmt.Errorf(
+				"service verification failed: %w",
+				err,
+			)
+		}
+	}
+
+	return nil
+}
+
+func (p *PeerRoute) sendMessageToPeer(
+	ctx context.Context,
+	peerID string,
+	msg *PeerMessage,
+) error {
+
+	p.mu.RLock()
+
+	peer, ok := p.peers[peerID]
+
+	p.mu.RUnlock()
+
+	if !ok {
+
+		return fmt.Errorf(
+			"peer not found: %s",
+			peerID,
+		)
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	select {
+
+	case peer.SendQueue <- data:
+		return nil
+
+	case <-ctx.Done():
+		return ctx.Err()
+
+	default:
+
+		return fmt.Errorf(
+			"peer send queue full",
+		)
+	}
+}
+
+func (p *PeerRoute) broadcastMessage(
+	ctx context.Context,
+	msg *PeerMessage,
+) error {
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	p.mu.RLock()
+
+	peers := make(
+		[]*PeerSession,
+		0,
+		len(p.peers),
+	)
+
+	for _, peer := range p.peers {
+		peers = append(peers, peer)
+	}
+
+	p.mu.RUnlock()
+
+	for _, peer := range peers {
+
+		select {
+
+		case peer.SendQueue <- data:
+
+		case <-ctx.Done():
+			return ctx.Err()
+
+		default:
+
+			if p.Logger != nil {
+
+				p.Logger.Error(
+					fmt.Sprintf(
+						"Peer queue full: %s",
+						peer.ID,
+					),
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *PeerRoute) peerWriteLoop(
+	peer *PeerSession,
+) {
+
+	defer p.wg.Done()
+
+	for {
+
+		select {
+
+		case <-p.ctx.Done():
+			return
+
+		case payload, ok := <-peer.SendQueue:
+
+			if !ok {
+				return
+			}
+
+			writeCtx, cancel := context.WithTimeout(
+				p.ctx,
+				DefaultPeerWriteTimeout,
+			)
+
+			err := peer.Node.SendAction(
+				APIPayload{
+					Action:  "peer_message",
+					Content: string(payload),
+				},
+			)
+
+			cancel()
+
+			if err != nil {
 
 				if p.Logger != nil {
 
 					p.Logger.Error(
 						fmt.Sprintf(
-							"Broadcast failed: %v",
+							"Peer write failed [%s]: %v",
+							peer.ID,
 							err,
 						),
 					)
 				}
+
+				p.RemovePeer(peer.ID)
+
+				return
+			}
+
+			peer.LastSeen = time.Now().Unix()
+
+			select {
+
+			case <-writeCtx.Done():
+
+			default:
 			}
 		}
 	}
 }
 
-func (p *PeerRoute) SetAccessPolicy(
-	remoteID NodeID,
-	level AccessLevel,
-) {
+func (p *PeerRoute) reaperLoop() {
 
-	p.policiesMu.Lock()
-	defer p.policiesMu.Unlock()
+	defer p.wg.Done()
 
-	p.policies[remoteID] = level
+	ticker := time.NewTicker(
+		2 * time.Minute,
+	)
 
-	if p.Logger != nil {
+	defer ticker.Stop()
 
-		p.Logger.Audit(
-			fmt.Sprintf("%x", remoteID[:8]),
-			"ACCESS_POLICY_UPDATED",
-			fmt.Sprintf(
-				"Policy set to level %d",
-				level,
-			),
-		)
-	}
-}
+	for {
 
-func (p *PeerRoute) EvaluateSwarmHandshake(
-	remoteIdentity []byte,
-	intent string,
-) (bool, error) {
+		select {
 
-	var remoteID NodeID
-	copy(remoteID[:], remoteIdentity)
+		case <-p.ctx.Done():
+			return
 
-	p.policiesMu.RLock()
-	level, exists := p.policies[remoteID]
-	p.policiesMu.RUnlock()
+		case <-ticker.C:
 
-	if !exists {
+			now := time.Now().Unix()
 
-		if p.Logger != nil {
+			var expired []string
 
-			p.Logger.Audit(
-				fmt.Sprintf("%x", remoteIdentity[:8]),
-				"HANDSHAKE_REJECTED",
-				"No access policy established",
-			)
-		}
+			p.mu.RLock()
 
-		return false, errors.New(
-			"connection rejected: no access policy established",
-		)
-	}
+			for id, peer := range p.peers {
 
-	switch level {
-
-	case Reject:
-
-		if p.Logger != nil {
-
-			p.Logger.Audit(
-				fmt.Sprintf("%x", remoteIdentity[:8]),
-				"HANDSHAKE_REJECTED",
-				"Peer explicitly rejected",
-			)
-		}
-
-		return false, errors.New(
-			"connection rejected by policy",
-		)
-
-	case ReadOnly:
-
-		if intent != "S2P_PULL" {
-
-			if p.Logger != nil {
-
-				p.Logger.Audit(
-					fmt.Sprintf("%x", remoteIdentity[:8]),
-					"HANDSHAKE_REJECTED",
-					"Read-only policy enforced",
-				)
+				if now-peer.LastSeen > 300 {
+					expired = append(expired, id)
+				}
 			}
 
-			return false, errors.New(
-				"read-only access enforced",
-			)
-		}
+			p.mu.RUnlock()
 
-		return true, nil
+			for _, id := range expired {
 
-	case See:
-		return true, nil
+				if p.Logger != nil {
 
-	default:
-		return false, errors.New(
-			"unknown access level",
-		)
-	}
-}
+					p.Logger.Info(
+						fmt.Sprintf(
+							"Reaping stale peer: %s",
+							id,
+						),
+					)
+				}
 
-func (p *PeerRoute) PublishToSwarm(
-	ctx context.Context,
-	payload []byte,
-) (NodeID, error) {
-
-	hash := sha256.Sum256(payload)
-
-	var objID NodeID
-	copy(objID[:], hash[:])
-
-	signature := p.auth.SignPayload(payload)
-
-	obj := SwarmObject{
-		ObjectID:  objID,
-		OwnerID:   p.localID,
-		Payload:   payload,
-		Signature: signature,
-		CreatedAt: time.Now(),
-	}
-
-	objBytes, err := json.Marshal(obj)
-	if err != nil {
-		return objID, err
-	}
-
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	err = p.db.Write(
-		CachePageID,
-		txn,
-		objID[:],
-		objBytes,
-		72*time.Hour,
-	)
-
-	if err != nil {
-
-		if p.Logger != nil {
-
-			p.Logger.Error(
-				fmt.Sprintf(
-					"Failed swarm publish: %v",
-					err,
-				),
-			)
-		}
-
-		return objID, err
-	}
-
-	if p.Logger != nil {
-
-		p.Logger.Info(
-			fmt.Sprintf(
-				"Published object %x to swarm cache",
-				objID[:8],
-			),
-		)
-	}
-
-	go p.Broadcast(ctx, payload)
-
-	return objID, nil
-}
-
-func (p *PeerRoute) PullFromSwarm(
-	ctx context.Context,
-	objID NodeID,
-) ([]byte, error) {
-
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	valBytes, err := p.db.Read(
-		CachePageID,
-		txn,
-		objID[:],
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if valBytes == nil {
-		return nil, errors.New(
-			"object not found",
-		)
-	}
-
-	var obj SwarmObject
-
-	if err := json.Unmarshal(
-		valBytes,
-		&obj,
-	); err != nil {
-
-		return nil, err
-	}
-
-	if p.Logger != nil {
-
-		p.Logger.Debug(
-			fmt.Sprintf(
-				"Pulled object %x from swarm cache",
-				objID[:8],
-			),
-		)
-	}
-
-	return obj.Payload, nil
-}
-
-func (p *PeerRoute) RevokeObject(
-	ctx context.Context,
-	objID NodeID,
-) error {
-
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	err := p.db.Write(
-		CachePageID,
-		txn,
-		objID[:],
-		[]byte{},
-		time.Nanosecond,
-	)
-
-	if err != nil {
-
-		if p.Logger != nil {
-
-			p.Logger.Error(
-				fmt.Sprintf(
-					"Failed object revoke: %v",
-					err,
-				),
-			)
-		}
-
-		return err
-	}
-
-	if p.Logger != nil {
-
-		p.Logger.Info(
-			fmt.Sprintf(
-				"Revoked object %x from swarm cache",
-				objID[:8],
-			),
-		)
-	}
-
-	return nil
-}
-
-func (p *PeerRoute) FindClosestNodes(
-	targetID NodeID,
-	count int,
-) ([]RoutingEntry, error) {
-
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	prefix := []byte("dht_node:")
-
-	closest := make([]RoutingEntry, 0)
-
-	err := p.db.Scan(
-		SystemPageID,
-		txn,
-		prefix,
-
-		func(key, value []byte) bool {
-
-			var entry RoutingEntry
-
-			if err := json.Unmarshal(
-				value,
-				&entry,
-			); err == nil {
-
-				closest = append(
-					closest,
-					entry,
-				)
+				p.RemovePeer(id)
 			}
-
-			return true
-		},
-	)
-
-	if err != nil {
-		return nil, err
+		}
 	}
-
-	sort.Slice(
-		closest,
-		func(i, j int) bool {
-
-			distI := xorDistance(
-				closest[i].ID,
-				targetID,
-			)
-
-			distJ := xorDistance(
-				closest[j].ID,
-				targetID,
-			)
-
-			return bytes.Compare(
-				distI[:],
-				distJ[:],
-			) < 0
-		},
-	)
-
-	if len(closest) > count {
-		closest = closest[:count]
-	}
-
-	if p.Logger != nil {
-
-		p.Logger.Debug(
-			fmt.Sprintf(
-				"Located %d closest nodes",
-				len(closest),
-			),
-		)
-	}
-
-	return closest, nil
 }
 
-func (p *PeerRoute) UpdateRoutingTable(
-	remoteID NodeID,
-	address string,
-	dbscProof []byte,
-) error {
+func (p *PeerRoute) PeerCount() int {
 
-	isValid, err := p.auth.VerifyAddressClaim(
-		remoteID[:],
-		address,
-		dbscProof,
-	)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-	if err != nil || !isValid {
-
-		if p.Logger != nil {
-
-			p.Logger.Audit(
-				fmt.Sprintf("%x", remoteID[:8]),
-				"ROUTING_REJECTED",
-				"Hardware verification failed",
-			)
-		}
-
-		return errors.New(
-			"hardware verification failed",
-		)
-	}
-
-	entry := RoutingEntry{
-		ID:        remoteID,
-		Address:   address,
-		UpdatedAt: time.Now(),
-	}
-
-	valBytes, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-
-	key := append(
-		[]byte("dht_node:"),
-		remoteID[:]...,
-	)
-
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	err = p.db.Write(
-		SystemPageID,
-		txn,
-		key,
-		valBytes,
-		2*time.Hour,
-	)
-
-	if err != nil {
-
-		if p.Logger != nil {
-
-			p.Logger.Error(
-				fmt.Sprintf(
-					"Failed routing update: %v",
-					err,
-				),
-			)
-		}
-
-		return err
-	}
-
-	if p.Logger != nil {
-
-		p.Logger.Info(
-			fmt.Sprintf(
-				"Routing updated for node %x (%s)",
-				remoteID[:8],
-				address,
-			),
-		)
-	}
-
-	return nil
+	return len(p.peers)
 }
 
-func xorDistance(
-	a,
-	b NodeID,
-) NodeID {
+func (p *PeerRoute) ListPeers() []string {
 
-	var result NodeID
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-	for i := 0; i < len(a); i++ {
-		result[i] = a[i] ^ b[i]
+	out := make([]string, 0, len(p.peers))
+
+	for id := range p.peers {
+		out = append(out, id)
 	}
 
-	return result
+	return out
+}
+
+func generatePeerMessageID() string {
+
+	b := make([]byte, 16)
+
+	_, _ = rand.Read(b)
+
+	return base64.RawURLEncoding.EncodeToString(b)
 }
