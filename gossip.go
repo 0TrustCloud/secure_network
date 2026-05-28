@@ -2,13 +2,9 @@ package secure_network
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gddisney/logger"
@@ -16,152 +12,106 @@ import (
 	"github.com/gddisney/ultimate_db"
 )
 
-const (
-	GossipPageID ultimate_db.PageID = 4
-)
-
 type GossipEnvelope struct {
-	ID        string `json:"id"`
-	Topic     string `json:"topic"`
-	Payload   []byte `json:"payload"`
-	Origin    []byte `json:"origin"`
-	ServiceID string `json:"service_id"`
-	Signature []byte `json:"signature"`
-	Timestamp int64  `json:"timestamp"`
-	Lamport   uint64 `json:"lamport"`
-	TTL       int    `json:"ttl"`
+	ID         string    `json:"id"`
+	ServiceID  string    `json:"service_id"`
+	Payload    []byte    `json:"payload"`
+	Signature  []byte    `json:"signature"`
+	Lamport    uint64    `json:"lamport"`
+	Origin     []byte    `json:"origin"`
+	ReceivedAt time.Time `json:"received_at"`
 }
+
+type GossipHandler func(
+	ctx context.Context,
+	env *GossipEnvelope,
+) error
 
 type GossipManager struct {
 	db *ultimate_db.DB
 
-	peerMesh *PeerRoute
+	peerRoute *PeerRoute
 
 	serviceKeys *service_keys.ServiceKeyManager
 
 	Logger *logger.LogDispatcher
 
-	clock atomic.Uint64
-
 	mu sync.RWMutex
 
+	handlers map[string]GossipHandler
+
 	seen map[string]time.Time
+
+	lamport uint64
 }
 
 func NewGossipManager(
 	db *ultimate_db.DB,
-	peerMesh *PeerRoute,
+	peerRoute *PeerRoute,
 	skm *service_keys.ServiceKeyManager,
 	sysLog *logger.LogDispatcher,
 ) *GossipManager {
 
-	gm := &GossipManager{
+	return &GossipManager{
 		db:          db,
-		peerMesh:    peerMesh,
+		peerRoute:   peerRoute,
 		serviceKeys: skm,
 		Logger:      sysLog,
+		handlers:    make(map[string]GossipHandler),
 		seen:        make(map[string]time.Time),
 	}
-
-	go gm.cleanupLoop()
-
-	return gm
 }
 
-func (gm *GossipManager) Name() string {
-	return "gossip_manager"
-}
-
-func (gm *GossipManager) Init(
-	router *Router,
-) error {
-	return nil
-}
-
-func (gm *GossipManager) Start() error {
-
-	if gm.Logger != nil {
-		gm.Logger.Info(
-			"Gossip manager online",
-		)
-	}
-
-	return nil
-}
-
-func (gm *GossipManager) Tick() uint64 {
-
-	return gm.clock.Add(1)
-}
-
-func (gm *GossipManager) updateClock(
-	remote uint64,
+func (gm *GossipManager) RegisterHandler(
+	serviceID string,
+	handler GossipHandler,
 ) {
 
-	for {
+	gm.mu.Lock()
+	defer gm.mu.Unlock()
 
-		local := gm.clock.Load()
+	gm.handlers[serviceID] = handler
 
-		next := remote + 1
+	if gm.Logger != nil {
 
-		if local >= next {
-			return
-		}
-
-		if gm.clock.CompareAndSwap(
-			local,
-			next,
-		) {
-			return
-		}
+		gm.Logger.Info(
+			fmt.Sprintf(
+				"Gossip handler registered: %s",
+				serviceID,
+			),
+		)
 	}
 }
 
 func (gm *GossipManager) Publish(
 	ctx context.Context,
-	topic string,
-	payload []byte,
 	serviceID string,
-	privKey ed25519.PrivateKey,
+	payload []byte,
+	signature []byte,
 ) error {
 
-	lamport := gm.Tick()
+	gm.mu.Lock()
 
-	hash := sha256.Sum256(
-		append(
-			[]byte(topic),
-			payload...,
-		),
-	)
+	gm.lamport++
 
-	id := hex.EncodeToString(
-		hash[:],
-	)
+	lamport := gm.lamport
 
-	signingPayload := fmt.Sprintf(
-		"%s|%s|%d",
-		id,
-		serviceID,
-		lamport,
-	)
-
-	signature := ed25519.Sign(
-		privKey,
-		[]byte(signingPayload),
-	)
+	gm.mu.Unlock()
 
 	env := GossipEnvelope{
-		ID:        id,
-		Topic:     topic,
-		Payload:   payload,
-		ServiceID: serviceID,
-		Signature: signature,
-		Timestamp: time.Now().Unix(),
-		Lamport:   lamport,
-		TTL:       6,
+		ID: fmt.Sprintf(
+			"%s-%d",
+			serviceID,
+			time.Now().UnixNano(),
+		),
+		ServiceID:  serviceID,
+		Payload:    payload,
+		Signature:  signature,
+		Lamport:    lamport,
+		ReceivedAt: time.Now(),
 	}
 
-	data, err := json.Marshal(
+	raw, err := json.Marshal(
 		env,
 	)
 
@@ -169,30 +119,16 @@ func (gm *GossipManager) Publish(
 		return err
 	}
 
-	gm.trackSeen(id)
-
-	if gm.Logger != nil {
-
-		gm.Logger.Debug(
-			fmt.Sprintf(
-				"Gossip publish topic=%s id=%s",
-				topic,
-				id[:12],
-			),
-		)
-	}
-
-	return gm.peerMesh.Broadcast(
+	return gm.peerRoute.Broadcast(
 		ctx,
 		"gossip",
-		data,
+		raw,
 	)
 }
 
 func (gm *GossipManager) HandleIngress(
 	ctx context.Context,
 	payload []byte,
-	remote *PeerIdentity,
 ) error {
 
 	var env GossipEnvelope
@@ -205,209 +141,133 @@ func (gm *GossipManager) HandleIngress(
 		return err
 	}
 
-	if env.ID == "" {
-		return fmt.Errorf(
-			"missing gossip id",
+	gm.mu.Lock()
+
+	if ts, exists := gm.seen[env.ID]; exists {
+
+		if time.Since(ts) < time.Hour {
+
+			gm.mu.Unlock()
+			return nil
+		}
+	}
+
+	gm.seen[env.ID] = time.Now()
+
+	if env.Lamport > gm.lamport {
+
+		gm.lamport = env.Lamport
+	}
+
+	gm.lamport++
+
+	gm.mu.Unlock()
+
+	if gm.serviceKeys != nil {
+
+		valid := gm.serviceKeys.VerifySignature(
+			env.ServiceID,
+			env.Payload,
+			env.Signature,
 		)
+
+		if !valid {
+
+			if gm.Logger != nil {
+
+				gm.Logger.Error(
+					fmt.Sprintf(
+						"Invalid gossip signature for %s",
+						env.ServiceID,
+					),
+				)
+			}
+
+			return fmt.Errorf(
+				"invalid gossip signature",
+			)
+		}
 	}
 
-	if gm.hasSeen(env.ID) {
-		return nil
-	}
+	gm.mu.RLock()
 
-	gm.updateClock(
-		env.Lamport,
-	)
+	handler, ok := gm.handlers[env.ServiceID]
 
-	signingPayload := fmt.Sprintf(
-		"%s|%s|%d",
-		env.ID,
-		env.ServiceID,
-		env.Lamport,
-	)
+	gm.mu.RUnlock()
 
-	// Bypass temporarily until implemented in service_keys.ServiceKeyManager
-	// valid := gm.serviceKeys.VerifySignature(
-	// 	env.ServiceID,
-	// 	[]byte(signingPayload),
-	// 	env.Signature,
-	// )
-	valid := true
-
-	if !valid {
+	if !ok {
 
 		if gm.Logger != nil {
 
-			gm.Logger.Audit(
-				"gossip",
-				"SIGNATURE_REJECTED",
+			gm.Logger.Error(
 				fmt.Sprintf(
-					"Rejected gossip packet %s",
-					env.ID,
+					"No gossip handler for %s",
+					env.ServiceID,
 				),
 			)
 		}
 
-		return fmt.Errorf(
-			"invalid gossip signature",
-		)
-	}
-
-	gm.trackSeen(
-		env.ID,
-	)
-
-	gm.persistEnvelope(
-		env,
-	)
-
-	if gm.Logger != nil {
-
-		gm.Logger.Debug(
-			fmt.Sprintf(
-				"Gossip ingress topic=%s id=%s",
-				env.Topic,
-				env.ID[:12],
-			),
-		)
-	}
-
-	if env.TTL <= 0 {
 		return nil
 	}
 
-	env.TTL--
-
-	relayBytes, err := json.Marshal(
-		env,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return gm.peerMesh.Broadcast(
+	return handler(
 		ctx,
-		"gossip",
-		relayBytes,
+		&env,
 	)
 }
 
-func (gm *GossipManager) persistEnvelope(
-	env GossipEnvelope,
-) {
-
-	data, err := json.Marshal(
-		env,
-	)
-
-	if err != nil {
-		return
-	}
-
-	txn := gm.db.BeginTxn()
-
-	err = gm.db.Write(
-		GossipPageID,
-		txn,
-		[]byte(env.ID),
-		data,
-		24*time.Hour,
-	)
-
-	if err != nil {
-
-		// ultimate_db does not support RollbackTxn currently
-		// gm.db.RollbackTxn(
-		// 	txn,
-		// )
-
-		return
-	}
-
-	gm.db.CommitTxn(
-		txn,
-	)
-}
-
-func (gm *GossipManager) trackSeen(
-	id string,
-) {
+func (gm *GossipManager) CleanupSeenCache() {
 
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
 
-	gm.seen[id] = time.Now()
+	cutoff := time.Now().Add(
+		-1 * time.Hour,
+	)
+
+	for id, ts := range gm.seen {
+
+		if ts.Before(cutoff) {
+
+			delete(
+				gm.seen,
+				id,
+			)
+		}
+	}
 }
 
-func (gm *GossipManager) hasSeen(
-	id string,
-) bool {
-
-	gm.mu.RLock()
-	defer gm.mu.RUnlock()
-
-	_, ok := gm.seen[id]
-
-	return ok
-}
-
-func (gm *GossipManager) cleanupLoop() {
+func (gm *GossipManager) StartJanitor() {
 
 	ticker := time.NewTicker(
 		15 * time.Minute,
 	)
 
-	defer ticker.Stop()
+	go func() {
 
-	for range ticker.C {
+		defer ticker.Stop()
 
-		cutoff := time.Now().Add(
-			-1 * time.Hour,
-		)
+		for range ticker.C {
 
-		gm.mu.Lock()
-
-		for k, v := range gm.seen {
-
-			if v.Before(cutoff) {
-				delete(
-					gm.seen,
-					k,
-				)
-			}
+			gm.CleanupSeenCache()
 		}
-
-		gm.mu.Unlock()
-	}
+	}()
 }
 
-func (gm *GossipManager) QueryEnvelope(
-	id string,
-) (*GossipEnvelope, error) {
+func (gm *GossipManager) GetLamport() uint64 {
 
-	txn := gm.db.BeginTxn()
-	defer gm.db.CommitTxn(txn)
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
 
-	raw, err := gm.db.Read(
-		GossipPageID,
-		txn,
-		[]byte(id),
+	return gm.lamport
+}
+
+func (gm *GossipManager) SeenCount() int {
+
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+
+	return len(
+		gm.seen,
 	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var env GossipEnvelope
-
-	if err := json.Unmarshal(
-		raw,
-		&env,
-	); err != nil {
-
-		return nil, err
-	}
-
-	return &env, nil
 }
