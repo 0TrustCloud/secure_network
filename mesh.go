@@ -9,10 +9,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
-	"time"
 
 	"github.com/flynn/noise"
 	"github.com/gddisney/logger"
@@ -39,8 +40,8 @@ type MeshNode struct {
 
 	cipher noise.CipherSuite
 
-	conn   quic.Conn
-	stream quic.Stream
+	conn   *quic.Conn
+	stream *quic.Stream
 
 	csSend *noise.CipherState
 	csRecv *noise.CipherState
@@ -268,8 +269,16 @@ func (m *MeshNode) Connect(
 		return err
 	}
 
-	if err := WriteFrame(stream, msg); err != nil {
-		conn.CloseWithError(0, "handshake send failed")
+	if err := WriteFrame(
+		stream,
+		msg,
+	); err != nil {
+
+		conn.CloseWithError(
+			0,
+			"handshake send failed",
+		)
+
 		return err
 	}
 
@@ -279,7 +288,11 @@ func (m *MeshNode) Connect(
 	)
 
 	if err != nil {
-		conn.CloseWithError(0, "handshake read failed")
+		conn.CloseWithError(
+			0,
+			"handshake read failed",
+		)
+
 		return err
 	}
 
@@ -288,7 +301,10 @@ func (m *MeshNode) Connect(
 		resp,
 	); err != nil {
 
-		conn.CloseWithError(0, "handshake rejected")
+		conn.CloseWithError(
+			0,
+			"handshake rejected",
+		)
 
 		return fmt.Errorf(
 			"gateway rejected Noise handshake: %w",
@@ -296,12 +312,13 @@ func (m *MeshNode) Connect(
 		)
 	}
 
-	m.conn = conn
-	m.stream = stream
+	m.conn = &conn
+	m.stream = &stream
 	m.csSend = csSend
 	m.csRecv = csRecv
 
 	if m.Logger != nil {
+
 		m.Logger.Info(
 			fmt.Sprintf(
 				"Mesh overlay connected. Node: %x",
@@ -320,7 +337,8 @@ func (m *MeshNode) Close() error {
 	m.cancel()
 
 	if m.conn != nil {
-		return m.conn.CloseWithError(
+
+		return (*m.conn).CloseWithError(
 			0,
 			"shutdown",
 		)
@@ -356,6 +374,7 @@ func (m *MeshNode) SendAction(
 	)
 
 	if err != nil {
+
 		return fmt.Errorf(
 			"noise encryption failed: %w",
 			err,
@@ -388,6 +407,7 @@ func (m *MeshNode) listenLoop() {
 		if err != nil {
 
 			if m.Logger != nil {
+
 				m.Logger.Error(
 					fmt.Sprintf(
 						"Mesh stream closed: %v",
@@ -408,6 +428,7 @@ func (m *MeshNode) listenLoop() {
 		if err != nil {
 
 			if m.Logger != nil {
+
 				m.Logger.Error(
 					fmt.Sprintf(
 						"Noise decrypt failed: %v",
@@ -468,6 +489,7 @@ func (m *MeshNode) handleHeartbeat(
 	if err != nil {
 
 		if m.Logger != nil {
+
 			m.Logger.Error(
 				fmt.Sprintf(
 					"Heartbeat signing failed: %v",
@@ -560,4 +582,75 @@ func (m *MeshNode) VerifyMachineIdentity(
 		hash[:],
 		sigBytes,
 	)
+}
+
+func WriteFrame(
+	w io.Writer,
+	payload []byte,
+) error {
+
+	size := uint32(len(payload))
+
+	var hdr [4]byte
+
+	binary.BigEndian.PutUint32(
+		hdr[:],
+		size,
+	)
+
+	if _, err := w.Write(
+		hdr[:],
+	); err != nil {
+
+		return err
+	}
+
+	_, err := w.Write(payload)
+
+	return err
+}
+
+func ReadFrame(
+	r io.Reader,
+	maxSize uint32,
+) ([]byte, error) {
+
+	var hdr [4]byte
+
+	if _, err := io.ReadFull(
+		r,
+		hdr[:],
+	); err != nil {
+
+		return nil, err
+	}
+
+	size := binary.BigEndian.Uint32(
+		hdr[:],
+	)
+
+	if size == 0 {
+
+		return nil,
+			fmt.Errorf(
+				"empty frame",
+			)
+	}
+
+	if size > maxSize {
+
+		return nil,
+			fmt.Errorf(
+				"frame exceeds max size",
+			)
+	}
+
+	buf := make([]byte, size)
+
+	_, err := io.ReadFull(
+		r,
+		buf,
+	)
+
+	return buf, err
 }
