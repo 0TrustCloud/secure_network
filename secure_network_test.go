@@ -315,3 +315,350 @@ func TestPeerRouteLifecycle(
 		)
 	}
 }
+
+func TestTunnelManagerInitialization(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	if tm == nil {
+
+		t.Fatal(
+			"tunnel manager is nil",
+		)
+	}
+
+	if tm.Name() != "mesh_tunnel" {
+
+		t.Fatal(
+			"unexpected module name",
+		)
+	}
+}
+
+func TestTunnelManagerRegisterTunnelNilPolicy(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	auth := TunnelAuthPayload{
+		Subdomain:    "demo",
+		IdentityType: "human",
+		Credential:   "token",
+	}
+
+	authBytes, err := json.Marshal(
+		auth,
+	)
+
+	if err != nil {
+
+		t.Fatalf(
+			"marshal failed: %v",
+			err,
+		)
+	}
+
+	err = tm.RegisterTunnel(
+		nil,
+		authBytes,
+	)
+
+	if err == nil {
+
+		t.Fatal(
+			"expected error with nil dependencies",
+		)
+	}
+}
+
+func TestTunnelManagerBadPayload(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	err := tm.RegisterTunnel(
+		nil,
+		[]byte("invalid-json"),
+	)
+
+	if err == nil {
+
+		t.Fatal(
+			"expected malformed payload error",
+		)
+	}
+}
+
+func TestTunnelManagerUnknownIdentity(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	_, err := tm.authenticate(
+		TunnelAuthPayload{
+			IdentityType: "alien",
+		},
+	)
+
+	if err == nil {
+
+		t.Fatal(
+			"expected unknown identity error",
+		)
+	}
+}
+
+func TestTunnelManagerExpiredMachineProof(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	oldNonce := fmt.Sprintf(
+		"%d",
+		time.Now().Unix()-120,
+	)
+
+	_, err := tm.authenticate(
+		TunnelAuthPayload{
+			IdentityType: "machine",
+			Identifier:   "agent-1",
+			Credential:   "bad",
+			Nonce:        oldNonce,
+			Subdomain:    "demo",
+		},
+	)
+
+	if err == nil {
+
+		t.Fatal(
+			"expected expired DBSC proof",
+		)
+	}
+}
+
+func TestTunnelManagerHumanWithoutSessionManager(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	_, err := tm.authenticate(
+		TunnelAuthPayload{
+			IdentityType: "human",
+			Credential:   "fake-token",
+		},
+	)
+
+	if err == nil {
+
+		t.Fatal(
+			"expected validation failure",
+		)
+	}
+}
+
+func TestTunnelMapLifecycle(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	if tm.tunnels == nil {
+
+		t.Fatal(
+			"tunnel map not initialized",
+		)
+	}
+
+	if len(tm.tunnels) != 0 {
+
+		t.Fatal(
+			"unexpected initial tunnel count",
+		)
+	}
+
+	tm.mu.Lock()
+
+	tm.tunnels["alpha"] = nil
+
+	tm.mu.Unlock()
+
+	tm.mu.RLock()
+
+	_, ok := tm.tunnels["alpha"]
+
+	tm.mu.RUnlock()
+
+	if !ok {
+
+		t.Fatal(
+			"tunnel insert failed",
+		)
+	}
+
+	tm.mu.Lock()
+
+	delete(
+		tm.tunnels,
+		"alpha",
+	)
+
+	tm.mu.Unlock()
+
+	tm.mu.RLock()
+
+	_, ok = tm.tunnels["alpha"]
+
+	tm.mu.RUnlock()
+
+	if ok {
+
+		t.Fatal(
+			"tunnel delete failed",
+		)
+	}
+}
+
+func TestTunnelAuthPayloadJSON(
+	t *testing.T,
+) {
+
+	msg := TunnelAuthPayload{
+		Subdomain:    "app",
+		IdentityType: "human",
+		Identifier:   "alice",
+		Credential:   "token",
+		Nonce:        "123",
+	}
+
+	raw, err := json.Marshal(
+		msg,
+	)
+
+	if err != nil {
+
+		t.Fatalf(
+			"marshal failed: %v",
+			err,
+		)
+	}
+
+	var decoded TunnelAuthPayload
+
+	err = json.Unmarshal(
+		raw,
+		&decoded,
+	)
+
+	if err != nil {
+
+		t.Fatalf(
+			"unmarshal failed: %v",
+			err,
+		)
+	}
+
+	if decoded.Subdomain != "app" {
+
+		t.Fatal(
+			"subdomain mismatch",
+		)
+	}
+
+	if decoded.Identifier != "alice" {
+
+		t.Fatal(
+			"identifier mismatch",
+		)
+	}
+}
+
+func TestTunnelManagerInit(
+	t *testing.T,
+) {
+
+	tm := NewTunnelManager(
+		"8443",
+		nil,
+	)
+
+	router := &Router{
+		DB:             &ultimate_db.DB{},
+		PolicyEngine:   nil,
+		SessionManager: nil,
+	}
+
+	err := tm.Init(
+		router,
+	)
+
+	if err != nil {
+
+		t.Fatalf(
+			"init failed: %v",
+			err,
+		)
+	}
+
+	if tm.router == nil {
+
+		t.Fatal(
+			"router not assigned",
+		)
+	}
+}
+
+func TestTunnelAgentConfig(
+	t *testing.T,
+) {
+
+	cfg := TunnelAgentConfig{
+		GatewayAddr:  "localhost:9443",
+		LocalAddr:    "127.0.0.1:3000",
+		Subdomain:    "dashboard",
+		IdentityType: "human",
+		Identifier:   "alice",
+		SessionToken: "abc123",
+	}
+
+	if cfg.Subdomain != "dashboard" {
+
+		t.Fatal(
+			"subdomain mismatch",
+		)
+	}
+
+	if cfg.IdentityType != "human" {
+
+		t.Fatal(
+			"identity type mismatch",
+		)
+	}
+}
