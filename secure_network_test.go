@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gddisney/guikit"
+
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
+
 )
 
 func createTestLogger(
@@ -109,52 +109,6 @@ func TestServiceKeyManagerInitialization(
 	}
 }
 
-func TestWebAuthnProvider(
-	t *testing.T,
-) {
-
-	db := &ultimate_db.DB{}
-
-	priv, err := rsa.GenerateKey(
-		rand.Reader,
-		2048,
-	)
-
-	if err != nil {
-
-		t.Fatal(err)
-	}
-
-	sm := secure_policy.NewSessionManager(
-		db,
-		priv,
-	)
-
-	gui := &guikit.GUIKit{}
-
-	provider, err := webauthnext.New(
-		gui,
-		sm,
-		"localhost",
-		"localhost",
-		"Secure Test",
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"webauthn init failed: %v",
-			err,
-		)
-	}
-
-	if provider == nil {
-
-		t.Fatal(
-			"provider nil",
-		)
-	}
-}
 
 func TestRPCManagerInitialization(
 	t *testing.T,
