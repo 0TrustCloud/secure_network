@@ -8,63 +8,18 @@ import (
 	"time"
 
 	"github.com/gddisney/guikit"
-	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
 )
 
-func createTestNode(
-	t *testing.T,
-	db *ultimate_db.DB,
-) *SecureNode {
-
-	t.Helper()
-
-	logDisp, err := logger.NewLogDispatcher(
-		"test_node",
-		db,
-		ConfigPageID,
-		100,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"failed creating logger: %v",
-			err,
-		)
-	}
-
-	node, err := NewSecureNode(
-		db,
-		logDisp,
-		"localhost",
-		"http://localhost",
-		"Secure Test",
-		nil,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"failed creating secure node: %v",
-			err,
-		)
-	}
-
-	return node
-}
-
 func TestPolicyEngineInitialization(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
 	engine := secure_policy.NewPolicyEngine(
-		db,
+		nil,
 	)
 
 	if engine == nil {
@@ -78,8 +33,6 @@ func TestPolicyEngineInitialization(
 func TestSessionManagerInitialization(
 	t *testing.T,
 ) {
-
-	db := &ultimate_db.DB{}
 
 	rsaPriv, err := rsa.GenerateKey(
 		rand.Reader,
@@ -95,7 +48,7 @@ func TestSessionManagerInitialization(
 	}
 
 	manager := secure_policy.NewSessionManager(
-		db,
+		nil,
 		rsaPriv,
 	)
 
@@ -111,10 +64,8 @@ func TestServiceKeyManagerInitialization(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
 	manager := service_keys.NewServiceKeyManager(
-		db,
+		nil,
 		nil,
 		nil,
 	)
@@ -131,9 +82,15 @@ func TestGossipIngress(
 	t *testing.T,
 ) {
 
+	peerRoute := NewPeerRoute(
+		nil,
+		nil,
+		nil,
+	)
+
 	gossip := NewGossipManager(
 		nil,
-		&PeerRoute{},
+		peerRoute,
 		nil,
 		nil,
 	)
@@ -159,11 +116,10 @@ func TestGossipIngress(
 		)
 	}
 }
+
 func TestWebAuthnProvider(
 	t *testing.T,
 ) {
-
-	db := &ultimate_db.DB{}
 
 	rsaPriv, err := rsa.GenerateKey(
 		rand.Reader,
@@ -179,7 +135,7 @@ func TestWebAuthnProvider(
 	}
 
 	sessionManager := secure_policy.NewSessionManager(
-		db,
+		nil,
 		rsaPriv,
 	)
 
@@ -188,8 +144,8 @@ func TestWebAuthnProvider(
 	provider, err := webauthnext.New(
 		gui,
 		sessionManager,
-		"localhost",
-		"http://localhost",
+		"example.com",
+		"https://example.com",
 		"Secure Test",
 	)
 
@@ -213,8 +169,14 @@ func TestRPCManagerInitialization(
 	t *testing.T,
 ) {
 
+	peerRoute := NewPeerRoute(
+		nil,
+		nil,
+		nil,
+	)
+
 	rpc := NewRPCManager(
-		&PeerRoute{},
+		peerRoute,
 		nil,
 	)
 
@@ -230,8 +192,14 @@ func TestRPCRegistration(
 	t *testing.T,
 ) {
 
+	peerRoute := NewPeerRoute(
+		nil,
+		nil,
+		nil,
+	)
+
 	rpc := NewRPCManager(
-		&PeerRoute{},
+		peerRoute,
 		nil,
 	)
 
@@ -291,9 +259,15 @@ func TestGossipRegistration(
 	t *testing.T,
 ) {
 
+	peerRoute := NewPeerRoute(
+		nil,
+		nil,
+		nil,
+	)
+
 	gossip := NewGossipManager(
-		&ultimate_db.DB{},
-		&PeerRoute{},
+		nil,
+		peerRoute,
 		nil,
 		nil,
 	)
@@ -308,6 +282,7 @@ func TestGossipRegistration(
 		) error {
 
 			called = true
+
 			return nil
 		},
 	)
@@ -346,7 +321,11 @@ func TestPeerRouteLifecycle(
 	t *testing.T,
 ) {
 
-	peerRoute := &PeerRoute{}
+	peerRoute := NewPeerRoute(
+		nil,
+		nil,
+		nil,
+	)
 
 	var nodeID NodeID
 
