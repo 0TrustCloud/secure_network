@@ -2,350 +2,284 @@ package secure_network
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"fmt"
-	"net/http"
 
-	"github.com/gddisney/guikit"
 	"github.com/gddisney/logger"
-	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
+	"github.com/gddisney/secure_policy"
 )
 
-type EdgeNode struct {
+type SecureNode struct {
 	DB *ultimate_db.DB
 
-	Router   *Router
-	PeerMesh *PeerRoute
-	Gossip   *GossipManager
-	Gateway  *Gateway
-	MeshNode *MeshNode
+	Logger *logger.LogDispatcher
+
+	PolicyEngine *secure_policy.PolicyEngine
+
+	SessionManager *secure_policy.SessionManager
 
 	ServiceKeys *service_keys.ServiceKeyManager
 
-	Logger *logger.LogDispatcher
+	WebAuthn *webauthnext.Provider
+
+	Mesh *MeshNode
+
+	PeerRoute *PeerRoute
+
+	Gossip *GossipManager
+
+	RPC *RPCManager
 }
 
-func NewEdgeNode(
-	ctx context.Context,
-	dbPath string,
-	staticGatewayPubKey []byte,
-	auth *webauthnext.Provider,
-	sysLogger *logger.LogDispatcher,
-) (*EdgeNode, error) {
+func NewSecureNode(
+	db *ultimate_db.DB,
+	sysLog *logger.LogDispatcher,
+	rpID string,
+	rpOrigin string,
+	rpName string,
+	gatewayPub []byte,
+) (*SecureNode, error) {
 
-	// ==========================================
-	// DATABASE BOOTSTRAP
-	// ==========================================
+	if db == nil {
 
-	dm, err := ultimate_db.NewDiskManager(
-		dbPath,
-	)
-
-	if err != nil {
 		return nil,
 			fmt.Errorf(
-				"disk manager init failed: %w",
+				"database is nil",
+			)
+	}
+
+	if sysLog == nil {
+
+		sysLog = logger.NewLogDispatcher()
+	}
+
+	bp := db.BufferPool()
+
+	_, err := bp.NewPage()
+
+	if err != nil {
+
+		return nil,
+			fmt.Errorf(
+				"failed creating bootstrap page: %w",
 				err,
 			)
 	}
 
-	bp := ultimate_db.NewBufferPool(
-		dm,
-		1024,
-	)
-
-	wal, err := ultimate_db.NewBatchingWAL(
-		dbPath + ".wal",
+	rsaPrivKey, err := rsa.GenerateKey(
+		rand.Reader,
+		2048,
 	)
 
 	if err != nil {
+
 		return nil,
 			fmt.Errorf(
-				"WAL init failed: %w",
+				"failed generating RSA key: %w",
 				err,
 			)
 	}
 
-	db := ultimate_db.NewDB(
-		bp,
-		wal,
+	policyEngine := secure_policy.NewPolicyEngine(
+		db,
 	)
-
-	// ==========================================
-	// SYSTEM PAGE INITIALIZATION
-	// ==========================================
-
-	for i := 1; i <= 5; i++ {
-
-		pageID := ultimate_db.PageID(i)
-
-		if _, err := bp.FetchPage(pageID); err != nil {
-
-			_, _, err := bp.NewPage()
-
-			if err != nil {
-				return nil,
-					fmt.Errorf(
-						"page allocation failed: %w",
-						err,
-					)
-			}
-
-		} else {
-
-			bp.UnpinPage(
-				pageID,
-				false,
-			)
-		}
-	}
-
-	// ==========================================
-	// GUIKIT
-	// ==========================================
-
-	gk := &guikit.GUIKit{
-		DB:  db,
-		BP:  bp,
-		Mux: http.NewServeMux(),
-	}
-
-	// ==========================================
-	// POLICY ENGINE
-	// ==========================================
-
-	policyEngine := secure_policy.NewPolicyEngine()
 
 	sessionManager := secure_policy.NewSessionManager(
-		[]byte("secure-dbsc-secret"),
+		db,
+		rsaPrivKey,
 	)
 
-	// ==========================================
-	// ROUTER
-	// ==========================================
-
-	router, err := NewRouter(
+	skm, err := service_keys.LoadOrCreateManager(
 		db,
-		gk,
-		"secure_session_token",
-		policyEngine,
-		sessionManager,
-		sysLogger,
+		sysLog,
 	)
 
 	if err != nil {
+
 		return nil,
 			fmt.Errorf(
-				"router init failed: %w",
+				"failed loading service key manager: %w",
 				err,
 			)
 	}
 
-	// ==========================================
-	// SERVICE KEYS
-	// ==========================================
-
-	serviceKeyManager := service_keys.NewServiceKeyManager()
-
-	// ==========================================
-	// MESH NODE
-	// ==========================================
+	webAuthnProvider := webauthnext.New(
+		nil,
+		sessionManager,
+		rpID,
+		rpOrigin,
+		rpName,
+	)
 
 	meshNode, err := NewMeshNode(
 		db,
-		staticGatewayPubKey,
-		serviceKeyManager,
-		sysLogger,
+		gatewayPub,
+		skm,
+		sysLog,
 	)
 
 	if err != nil {
+
 		return nil,
 			fmt.Errorf(
-				"mesh node init failed: %w",
+				"failed creating mesh node: %w",
 				err,
 			)
 	}
 
-	// ==========================================
-	// PEER ROUTE
-	// ==========================================
-
-	peerMesh := NewPeerRoute(
+	peerRoute := NewPeerRoute(
 		meshNode,
-		serviceKeyManager,
-		sysLogger,
+		skm,
+		sysLog,
 	)
 
-	// ==========================================
-	// GOSSIP
-	// ==========================================
-
-	gossip := NewGossipManager(
+	gossipManager := NewGossipManager(
 		db,
-		peerMesh,
-		serviceKeyManager,
-		sysLogger,
+		peerRoute,
+		skm,
+		sysLog,
 	)
-
-	// ==========================================
-	// RPC ENGINE
-	// ==========================================
 
 	rpcManager := NewRPCManager(
-		peerMesh,
-		sysLogger,
+		peerRoute,
+		sysLog,
 	)
 
 	meshNode.SetRPCManager(
 		rpcManager,
 	)
 
-	// ==========================================
-	// ROUTE REGISTRATION
-	// ==========================================
-
-	peerMesh.RegisterHandler(
-		"gossip",
-		func(
-			ctx context.Context,
-			msg *PeerMessage,
-		) error {
-
-			return gossip.HandleIngress(
-				ctx,
-				msg.Payload,
-				nil,
-			)
-		},
-	)
-
-	peerMesh.RegisterHandler(
-		"rpc",
-		func(
-			ctx context.Context,
-			msg *PeerMessage,
-		) error {
-
-			rpcManager.handleIngress(
-				ctx,
-				msg.Payload,
-			)
-
-			return nil
-		},
-	)
-
-	// ==========================================
-	// GATEWAY
-	// ==========================================
-
-	gateway := NewGateway(
-		router,
-		peerMesh,
-		meshNode.noisePriv,
-		meshNode.noisePub,
-		sysLogger,
-	)
-
-	// ==========================================
-	// ROUTER MODULES
-	// ==========================================
-
-	router.Attach(
-		gossip,
-	)
-
-	router.Attach(
-		rpcManager,
-	)
-
-	tunnelManager := NewTunnelManager(
-		"8080",
-		sysLogger,
-	)
-
-	router.Attach(
-		tunnelManager,
-	)
-
-	// ==========================================
-	// NODE
-	// ==========================================
-
-	node := &EdgeNode{
-		DB:           db,
-		Router:       router,
-		PeerMesh:     peerMesh,
-		Gossip:       gossip,
-		Gateway:      gateway,
-		MeshNode:     meshNode,
-		ServiceKeys:  serviceKeyManager,
-		Logger:       sysLogger,
+	node := &SecureNode{
+		DB:             db,
+		Logger:         sysLog,
+		PolicyEngine:   policyEngine,
+		SessionManager: sessionManager,
+		ServiceKeys:    skm,
+		WebAuthn:       webAuthnProvider,
+		Mesh:           meshNode,
+		PeerRoute:      peerRoute,
+		Gossip:         gossipManager,
+		RPC:            rpcManager,
 	}
 
-	if sysLogger != nil {
+	gossipManager.StartJanitor()
 
-		sysLogger.Info(
-			fmt.Sprintf(
-				"EdgeNode initialized. Mesh ID: %x",
-				meshNode.noisePub[:8],
-			),
+	if sysLog != nil {
+
+		sysLog.Info(
+			"Secure node initialized",
 		)
 	}
 
 	return node, nil
 }
 
-func (n *EdgeNode) StartGateway(
-	port string,
-) error {
-
-	if n.Gateway == nil {
-		return fmt.Errorf(
-			"gateway not initialized",
-		)
-	}
-
-	return n.Gateway.ListenAndServe(
-		port,
-		nil,
-	)
-}
-
-func (n *EdgeNode) ConnectToGateway(
+func (n *SecureNode) ConnectMesh(
 	ctx context.Context,
-	addr string,
+	gatewayAddr string,
 ) error {
 
-	if n.MeshNode == nil {
+	if n.Mesh == nil {
+
 		return fmt.Errorf(
-			"mesh node not initialized",
+			"mesh subsystem unavailable",
 		)
 	}
 
-	return n.MeshNode.Connect(
+	return n.Mesh.Connect(
 		ctx,
-		addr,
+		gatewayAddr,
 	)
 }
 
-func (n *EdgeNode) Shutdown() error {
+func (n *SecureNode) Shutdown() error {
 
-	if n.Logger != nil {
-		n.Logger.Info(
-			"Shutting down EdgeNode...",
-		)
-	}
+	if n.Mesh != nil {
 
-	if n.MeshNode != nil {
-		_ = n.MeshNode.Close()
-	}
-
-	if n.DB != nil {
-		n.DB.Close()
+		return n.Mesh.Close()
 	}
 
 	return nil
 }
+
+func (n *SecureNode) RegisterRPC(
+	method string,
+	handler RPCHandler,
+) {
+
+	if n.RPC == nil {
+		return
+	}
+
+	n.RPC.Register(
+		method,
+		handler,
+	)
+}
+
+func (n *SecureNode) RegisterGossip(
+	serviceID string,
+	handler GossipHandler,
+) {
+
+	if n.Gossip == nil {
+		return
+	}
+
+	n.Gossip.RegisterHandler(
+		serviceID,
+		handler,
+	)
+}
+
+func (n *SecureNode) Broadcast(
+	ctx context.Context,
+	method string,
+	payload []byte,
+) error {
+
+	if n.RPC == nil {
+
+		return fmt.Errorf(
+			"rpc unavailable",
+		)
+	}
+
+	return n.RPC.Broadcast(
+		ctx,
+		method,
+		payload,
+	)
+}
+
+func (n *SecureNode) CallPeer(
+	ctx context.Context,
+	target []byte,
+	method string,
+	payload []byte,
+) ([]byte, error) {
+
+	if n.RPC == nil {
+
+		return nil,
+			fmt.Errorf(
+				"rpc unavailable",
+			)
+	}
+
+	return n.RPC.Call(
+		ctx,
+		target,
+		method,
+		payload,
+		DefaultRPCTimeout,
+	)
+}
+
+const (
+	DefaultRPCTimeout = 15_000_000_000
+)
