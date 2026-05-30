@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gddisney/logger"
+	"github.com/0TrustCloud/logger"
 )
 
 type RPCPacket struct {
