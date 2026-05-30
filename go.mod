@@ -4,9 +4,9 @@ go 1.25.10
 
 require (
 	github.com/flynn/noise v1.1.0
-	github.com/gddisney/guikit v1.0.5
-	github.com/gddisney/ultimate_db v1.0.5
-	github.com/gddisney/webauthnext v1.0.4-0.20260520202225-66034ca8acfa
+	github.com/0TrustCloud/guikit v1.0.5
+	github.com/0TrustCloud/ultimate_db v1.0.5
+	github.com/0trustCloud/webauthnext v1.0.4-0.20260520202225-66034ca8acfa
 	github.com/quic-go/quic-go v0.59.1
 )
 
