@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gddisney/logger"
-	"github.com/gddisney/secure_policy"
-	"github.com/gddisney/service_keys"
-	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
+	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/secure_policy"
+	"github.com/0TrustCloud/service_keys"
+	"github.com/0TrustCloud/ultimate_db"
+	"github.com/0TrustCloud/webauthnext"
 )
 
 type SecureNode struct {
