@@ -2,10 +2,6 @@ package secure_network
 
 import (
 	"context"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,9 +15,8 @@ import (
 
 	"github.com/0TrustCloud/logger"
 	"github.com/0TrustCloud/secure_policy"
+	"github.com/0TrustCloud/service_keys"
 	"github.com/0TrustCloud/ultimate_db"
-	"github.com/0TrustCloud/webauthnext"
-	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/quic-go/quic-go"
 )
 
@@ -64,6 +59,7 @@ type TunnelManager struct {
 	db         *ultimate_db.DB
 	pe         *secure_policy.PolicyEngine
 	sm         *secure_policy.SessionManager
+	skm        *service_keys.ServiceKeyManager
 	Logger     *logger.LogDispatcher
 	PublicPort string
 
@@ -91,6 +87,7 @@ func (t *TunnelManager) Init(r *Router) error {
 	t.db = r.DB
 	t.pe = r.PolicyEngine
 	t.sm = r.SessionManager
+	t.skm = r.ServiceKeyManager
 	return nil
 }
 
@@ -167,44 +164,15 @@ func (t *TunnelManager) authenticate(
 	}
 
 	if msg.IdentityType == "machine" {
-
 		var timestamp int64
-
 		fmt.Sscanf(msg.Nonce, "%d", &timestamp)
 
 		if time.Now().Unix()-timestamp > 60 {
 			return "", fmt.Errorf("DBSC proof expired")
 		}
 
-		txn := t.db.BeginTxn()
-
-		userBytes, _ := t.db.Read(
-			1,
-			txn,
-			[]byte("user:"+msg.Identifier),
-		)
-
-		t.db.CommitTxn(txn)
-
-		var user webauthnext.PasskeyUser
-
-		if err := json.Unmarshal(userBytes, &user); err != nil {
-			return "", err
-		}
-
-		tpmPubKey, err := tpm2.DecodePublic(user.ID)
-		if err != nil {
-			return "", err
-		}
-
-		cryptoKey, err := tpmPubKey.Key()
-		if err != nil {
-			return "", err
-		}
-
-		rsaKey, ok := cryptoKey.(*rsa.PublicKey)
-		if !ok {
-			return "", fmt.Errorf("invalid RSA public key")
+		if t.skm == nil {
+			return "", fmt.Errorf("service key manager uninitialized")
 		}
 
 		sig, err := base64.StdEncoding.DecodeString(msg.Credential)
@@ -212,19 +180,10 @@ func (t *TunnelManager) authenticate(
 			return "", err
 		}
 
-		payloadHash := sha256.Sum256(
-			[]byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain)),
-		)
+		payload := []byte(fmt.Sprintf("%s|%s", msg.Nonce, msg.Subdomain))
 
-		err = rsa.VerifyPKCS1v15(
-			rsaKey,
-			crypto.SHA256,
-			payloadHash[:],
-			sig,
-		)
-
-		if err != nil {
-			return "", err
+		if !t.skm.VerifySignature(msg.Identifier, payload, sig) {
+			return "", fmt.Errorf("hardware signature verification failed")
 		}
 
 		return msg.Identifier, nil
