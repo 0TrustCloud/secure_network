@@ -14,10 +14,10 @@ import (
 	"sync"
 
 	"github.com/flynn/noise"
-	"github.com/gddisney/logger"
-	"github.com/gddisney/service_keys"
-	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
+	"github.com/0TrustCloud/logger"
+	"github.com/0trustCloud/service_keys"
+	"github.com/0TrustCloud/ultimate_db"
+	"github.com/0TrustCloud/webauthnext"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/quic-go/quic-go"
 )
