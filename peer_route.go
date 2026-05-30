@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gddisney/logger"
-	"github.com/gddisney/service_keys"
+	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/service_keys"
 )
 
 type AccessPolicy int
