@@ -1,6 +1,0 @@
-*.exe
-*.test
-/bin/
-.env
-.env.*
-
