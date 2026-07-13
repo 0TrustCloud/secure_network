@@ -74,6 +74,22 @@ func (t *TunnelManager) Start() error {
 	return nil
 }
 
+// TunnelEntry describes an active WAN tunnel agent.
+type TunnelEntry struct {
+	Subdomain string `json:"subdomain"`
+	Online    bool   `json:"online"`
+}
+
+func (t *TunnelManager) ListTunnels() []TunnelEntry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]TunnelEntry, 0, len(t.tunnels))
+	for subdomain := range t.tunnels {
+		out = append(out, TunnelEntry{Subdomain: subdomain, Online: true})
+	}
+	return out
+}
+
 func (t *TunnelManager) RegisterTunnel(conn *quic.Conn, authMsg []byte) error {
 	var msg TunnelAuthPayload
 	if err := json.Unmarshal(authMsg, &msg); err != nil {

@@ -56,6 +56,7 @@ func NewSecureNode(
 		realm,
 		hostID,
 		issuerURL,
+		"0trust.services",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed creating auth provider domain map: %w", err)

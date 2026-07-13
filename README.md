@@ -7,7 +7,7 @@ The system is designed for:
 * secure edge gateways
 * distributed service meshes
 * authenticated overlay routing
-* encrypted peer-to-peer backplanes
+* encrypted overlay backplanes (gateway-mediated; no port punch)
 * hardware-bound machine identity
 * QUIC-native reverse tunnels
 * RPC and gossip propagation
@@ -62,11 +62,12 @@ The system is designed for:
 
 ## Secure Overlay Routing
 
-* Peer discovery and management
+* Peer discovery and management via **gateway dial-only** (agents dial published gateways)
 * Concurrent-safe routing tables
 * Dynamic peer registration
 * Broadcast routing
-* Direct peer messaging
+* Direct peer messaging **over the overlay** (not STUN/TURN/NAT hole punch)
+* **No port punching** — clients and agents always initiate to 0Trust endpoints
 
 ## Production Safety
 

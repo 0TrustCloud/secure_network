@@ -1,12 +1,14 @@
 package secure_network
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +33,12 @@ type ContentMeta struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+type hostPeer struct {
+	stream *quic.Stream
+	csSend *noise.CipherState
+	signer []byte
+}
+
 type Gateway struct {
 	router         *Router
 	peerMesh       *PeerRoute
@@ -39,6 +47,7 @@ type Gateway struct {
 	sPub           []byte
 	Logger         *logger.LogDispatcher
 	activeSessions sync.Map
+	hostSessions   sync.Map
 }
 
 func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte, sysLog *logger.LogDispatcher) *Gateway {
@@ -168,10 +177,11 @@ func (g *Gateway) HandleSecureStream(conn *quic.Conn, stream *quic.Stream) {
 			}
 		}
 
-		g.routeToAPI(remoteKey, decrypted)
+		g.routeToAPI(remoteKey, decrypted, stream, csSend)
 	}
 
 	g.activeSessions.Delete(sessionID)
+	g.clearHostSessions(remoteKey)
 }
 
 func (g *Gateway) isIdentityValid(pubKey []byte) bool {
@@ -207,14 +217,35 @@ func (g *Gateway) monitorHeartbeat(stream *quic.Stream, csSend *noise.CipherStat
 	}
 }
 
-func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
+func (g *Gateway) routeToAPI(signer []byte, payload []byte, stream *quic.Stream, csSend *noise.CipherState) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return
 	}
 
+	if req.Action == "mesh_register" {
+		var reg struct {
+			HostID string `json:"host_id"`
+		}
+		if json.Unmarshal([]byte(req.Content), &reg) == nil && reg.HostID != "" {
+			g.hostSessions.Store(reg.HostID, &hostPeer{stream: stream, csSend: csSend, signer: signer})
+			if g.Logger != nil {
+				g.Logger.Info(fmt.Sprintf("Mesh host registered: %s (%x)", reg.HostID, signer[:8]))
+			}
+		}
+		return
+	}
+
 	contextData := map[string]string{"target": req.Target}
 	resource := req.Target
+	if strings.HasPrefix(resource, "host:") {
+		switch req.Action {
+		case "ssh_proto":
+			resource = "ssh:exec"
+		case "k8s_proto":
+			resource = "k8s:exec"
+		}
+	}
 	if resource == "" {
 		resource = "*"
 	}
@@ -223,6 +254,17 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 		if g.Logger != nil {
 			g.Logger.Audit(fmt.Sprintf("%x", signer[:8]), "MESH_DENIED", "Gateway security evaluation block intercepted action: "+req.Action)
 		}
+		return
+	}
+
+	if strings.HasPrefix(req.Target, "host:") {
+		hostID := strings.TrimPrefix(req.Target, "host:")
+		if g.forwardToHost(hostID, payload) {
+			return
+		}
+	}
+
+	if g.router.DispatchProtocol(context.Background(), signer, req.Action, req.Content) {
 		return
 	}
 
@@ -267,4 +309,29 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 
 		g.router.LocalBus <- SystemEvent{Topic: "rpc_ingress", Payload: enrichedPayload}
 	}
+}
+
+func (g *Gateway) forwardToHost(hostID string, payload []byte) bool {
+	val, ok := g.hostSessions.Load(hostID)
+	if !ok {
+		return false
+	}
+	peer, ok := val.(*hostPeer)
+	if !ok || peer.stream == nil || peer.csSend == nil {
+		return false
+	}
+	enc, err := peer.csSend.Encrypt(nil, nil, payload)
+	if err != nil {
+		return false
+	}
+	return WriteFrame(peer.stream, enc) == nil
+}
+
+func (g *Gateway) clearHostSessions(signer []byte) {
+	g.hostSessions.Range(func(key, value any) bool {
+		if peer, ok := value.(*hostPeer); ok && string(peer.signer) == string(signer) {
+			g.hostSessions.Delete(key)
+		}
+		return true
+	})
 }

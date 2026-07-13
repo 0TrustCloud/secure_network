@@ -27,6 +27,7 @@ import (
 	"github.com/0TrustCloud/secure_policy"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 type Module interface {
@@ -40,11 +41,37 @@ type SystemEvent struct {
 	Payload []byte
 }
 
+// PacketHandler processes mesh protocol payloads (ssh_proto, k8s_proto, etc.).
+type PacketHandler interface {
+	HandlePacket(ctx context.Context, content string) error
+}
+
+// ProtocolHandler runs after gateway policy evaluation for inbound mesh actions.
+type ProtocolHandler func(ctx context.Context, signer []byte, content string) error
+
+type RouterConfig struct {
+	ACME     ACMEConfig
+	HTTPOnly bool
+}
+
+type RouterOption func(*RouterConfig)
+
+func WithACME(cfg ACMEConfig) RouterOption {
+	return func(rc *RouterConfig) { rc.ACME = cfg }
+}
+
+func WithHTTPOnly(enabled bool) RouterOption {
+	return func(rc *RouterConfig) { rc.HTTPOnly = enabled }
+}
+
 type Router struct {
-	mu             sync.RWMutex
-	Port           string
-	TLSConfig      *tls.Config
-	Mux            *http.ServeMux
+	mu              sync.RWMutex
+	Port            string
+	QuicPort        string
+	TLSConfig       *tls.Config
+	AutocertManager *autocert.Manager
+	HTTPOnly        bool
+	Mux             *http.ServeMux
 	GUIKit         *guikit.GUIKit
 	SdfEngine      *secure_data_format.SecureDataEngine
 	TargetCookie   string
@@ -54,28 +81,55 @@ type Router struct {
 	ActiveTunnel   *quic.Conn // Aligned to proper concrete library pointer values
 	PolicyEngine   *secure_policy.PolicyEngine
 	SessionManager *secure_policy.SessionManager
-	Logger         *logger.LogDispatcher
+	Logger            *logger.LogDispatcher
+	protocolHandlers  map[string]ProtocolHandler
 }
 
-func NewRouter(sdf *secure_data_format.SecureDataEngine, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, sysLog *logger.LogDispatcher) (*Router, error) {
-	tlsConf, err := generateEphemeralTLS()
+func NewRouter(sdf *secure_data_format.SecureDataEngine, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, sysLog *logger.LogDispatcher, opts ...RouterOption) (*Router, error) {
+	rc := RouterConfig{}
+	for _, opt := range opts {
+		opt(&rc)
+	}
+	tlsBundle, err := resolveTLS(rc.ACME)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Router{
-		TLSConfig:      tlsConf,
-		Mux:            http.NewServeMux(),
+		TLSConfig:       tlsBundle.Config,
+		AutocertManager: tlsBundle.Manager,
+		HTTPOnly:        rc.HTTPOnly,
+		Mux:             http.NewServeMux(),
 		GUIKit:         gk,
 		SdfEngine:      sdf,
 		TargetCookie:   targetCookie,
 		RouteMap:       make(map[string]string),
-		Modules:        make(map[string]Module),
-		LocalBus:       make(chan SystemEvent, 2048),
+		Modules:          make(map[string]Module),
+		protocolHandlers: make(map[string]ProtocolHandler),
+		LocalBus:         make(chan SystemEvent, 2048),
 		PolicyEngine:   pe,
 		SessionManager: sm,
 		Logger:         sysLog,
 	}, nil
+}
+
+func (r *Router) RegisterProtocol(action string, handler ProtocolHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.protocolHandlers[action] = handler
+}
+
+func (r *Router) DispatchProtocol(ctx context.Context, signer []byte, action, content string) bool {
+	r.mu.RLock()
+	handler, ok := r.protocolHandlers[action]
+	r.mu.RUnlock()
+	if !ok || handler == nil {
+		return false
+	}
+	if err := handler(ctx, signer, content); err != nil && r.Logger != nil {
+		r.Logger.Error(fmt.Sprintf("protocol %s handler error: %v", action, err))
+	}
+	return true
 }
 
 func (r *Router) Attach(mod Module) {
@@ -151,7 +205,10 @@ func (w *dbscInterceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 func (r *Router) startQUICTunnel() {
-	tunnelPort := "9000"
+	tunnelPort := r.QuicPort
+	if tunnelPort == "" {
+		tunnelPort = "443"
+	}
 	listener, err := quic.ListenAddr(":"+tunnelPort, r.TLSConfig, &quic.Config{
 		EnableDatagrams: true,
 		KeepAlivePeriod: 30 * time.Second,
@@ -252,68 +309,8 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 }
 
 func (r *Router) setupDBSCRoutes() {
-	r.Mux.HandleFunc("/StartSession", func(w http.ResponseWriter, req *http.Request) {
-		yamlDomain := getDBSCDomain(r.RouteMap, req)
-		subject := []byte("hardware_subject_placeholder")
-
-		signedToken, jti, err := r.SessionManager.IssueCookieToken(subject, 24*time.Hour)
-		if err != nil {
-			http.Error(w, "Failed to issue token", http.StatusInternalServerError)
-			return
-		}
-
-		cookie := &http.Cookie{
-			Name:     r.TargetCookie,
-			Value:    signedToken,
-			MaxAge:   86400,
-			Domain:   yamlDomain,
-			Secure:   true,
-			SameSite: http.SameSiteLaxMode,
-		}
-		http.SetCookie(w, cookie)
-
-		if r.Logger != nil {
-			r.Logger.Audit("system", "DBSC_SESSION_ISSUED", fmt.Sprintf("Issued hardware-bound session on domain: %s", yamlDomain))
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		jsonResponse := fmt.Sprintf(`{
-			"session_identifier": "%s",
-			"refresh_url": "/RefreshEndpoint",
-			"credentials": [{"type": "cookie", "name": "%s", "attributes": "Domain=%s; Secure; SameSite=Lax"}]
-		}`, jti, r.TargetCookie, yamlDomain)
-		_, _ = w.Write([]byte(jsonResponse))
-	})
-
-	r.Mux.HandleFunc("/RefreshEndpoint", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if req.Header.Get("Secure-Session-Response") == "" {
-			w.Header().Set("Secure-Session-Challenge", `"challenge_value_12345"`)
-			w.WriteHeader(http.StatusForbidden)
-			return
-		}
-
-		yamlDomain := getDBSCDomain(r.RouteMap, req)
-		var cookieValue string
-		if c, err := req.Cookie(r.TargetCookie); err == nil {
-			cookieValue = c.Value
-		}
-
-		cookie := &http.Cookie{
-			Name:     r.TargetCookie,
-			Value:    cookieValue,
-			MaxAge:   600,
-			Domain:   yamlDomain,
-			Secure:   true,
-			SameSite: http.SameSiteLaxMode,
-		}
-		http.SetCookie(w, cookie)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("Session successfully bound and refreshed."))
-	})
+	r.Mux.HandleFunc("/StartSession", r.handleStartSession)
+	r.Mux.HandleFunc("/RefreshEndpoint", r.handleRefreshEndpoint)
 }
 
 func (r *Router) startDualStackIngress() {
@@ -341,13 +338,32 @@ func (r *Router) startDualStackIngress() {
 		}
 	})
 
-	h3Server := &http3.Server{Addr: ":" + r.Port, TLSConfig: r.TLSConfig, Handler: masterHandler}
+	ingressHandler := http.Handler(masterHandler)
+	if r.HTTPOnly {
+		tcpServer := &http.Server{
+			Addr:              ":" + r.Port,
+			Handler:           ingressHandler,
+			ReadHeaderTimeout: 30 * time.Second,
+		}
+		if r.Logger != nil {
+			r.Logger.Info(fmt.Sprintf("HTTP internal listener on :%s (TLS terminated at edge)", r.Port))
+		}
+		_ = tcpServer.ListenAndServe()
+		return
+	}
+
+	if r.AutocertManager != nil {
+		ingressHandler = r.AutocertManager.HTTPHandler(masterHandler)
+		r.startACMEHTTP(ingressHandler)
+	}
+
+	h3Server := &http3.Server{Addr: ":" + r.Port, TLSConfig: r.TLSConfig, Handler: ingressHandler}
 	tcpServer := &http.Server{
 		Addr:      ":" + r.Port,
 		TLSConfig: r.TLSConfig,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			_ = h3Server.SetQUICHeaders(w.Header())
-			masterHandler.ServeHTTP(w, req)
+			ingressHandler.ServeHTTP(w, req)
 		}),
 	}
 
@@ -368,6 +384,24 @@ func (r *Router) startDualStackIngress() {
 		_ = tcpServer.ListenAndServeTLS("", "")
 	}()
 	wg.Wait()
+}
+
+func (r *Router) startACMEHTTP(fallback http.Handler) {
+	httpSrv := &http.Server{
+		Addr:              ":80",
+		Handler:           fallback,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+	go func() {
+		if r.Logger != nil {
+			r.Logger.Info("ACME HTTP-01 challenge listener on :80")
+		} else {
+			log.Printf("[tls] ACME HTTP-01 challenge listener on :80")
+		}
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[tls] ACME HTTP listener: %v", err)
+		}
+	}()
 }
 
 func getDBSCDomain(routeMap map[string]string, req *http.Request) string {
@@ -391,7 +425,10 @@ func getDBSCDomain(routeMap map[string]string, req *http.Request) string {
 	return host
 }
 
-func generateEphemeralTLS() (*tls.Config, error) {
+func generateEphemeralTLS(domain string) (*tls.Config, error) {
+	if domain == "" {
+		domain = "0trust.cloud"
+	}
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -408,7 +445,7 @@ func generateEphemeralTLS() (*tls.Config, error) {
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
+		DNSNames:     []string{domain, "*." + domain},
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {

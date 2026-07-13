@@ -45,6 +45,8 @@ type MeshNode struct {
 
 	rpc *RPCManager
 
+	inboundHandlers map[string]PacketHandler
+
 	Logger *logger.LogDispatcher
 }
 
@@ -101,13 +103,25 @@ func NewMeshNode(sdf *secure_data_format.SecureDataEngine, gatePub []byte, sysLo
 		cipher:    noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
 		Logger:    sysLog,
 		ctx:       ctx,
-		cancel:    cancel,
+		cancel:          cancel,
+		inboundHandlers: make(map[string]PacketHandler),
 	}, nil
+}
+
+func (m *MeshNode) RegisterInbound(action string, handler PacketHandler) {
+	if m.inboundHandlers == nil {
+		m.inboundHandlers = make(map[string]PacketHandler)
+	}
+	m.inboundHandlers[action] = handler
 }
 
 func (m *MeshNode) SetRPCManager(rpc *RPCManager) { m.rpc = rpc }
 func (m *MeshNode) GetNoisePubKey() []byte      { return m.noisePub }
 func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey { return m.dbscPriv }
+
+func (m *MeshNode) Connected() bool {
+	return m.stream != nil && m.csSend != nil
+}
 
 func (m *MeshNode) Connect(ctx context.Context, gatewayAddr string) error {
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"secure-overlay"}}
@@ -247,6 +261,10 @@ func (m *MeshNode) listenLoop() {
 		case "rpc":
 			if m.rpc != nil {
 				m.rpc.handleIngress(context.Background(), []byte(req.Content))
+			}
+		default:
+			if handler, ok := m.inboundHandlers[req.Action]; ok && handler != nil {
+				_ = handler.HandlePacket(m.ctx, req.Content)
 			}
 		}
 	}

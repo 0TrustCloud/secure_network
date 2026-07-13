@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,9 +80,16 @@ func (pr *PeerRoute) Dispatch(ctx context.Context, msg *PeerMessage) error {
 	return handler(ctx, msg)
 }
 
+func (pr *PeerRoute) MeshConnected() bool {
+	return pr.meshNode != nil && pr.meshNode.Connected()
+}
+
 func (pr *PeerRoute) Broadcast(ctx context.Context, route string, payload []byte) error {
 	if pr.meshNode == nil {
 		return fmt.Errorf("mesh node context unavailable")
+	}
+	if !pr.meshNode.Connected() {
+		return fmt.Errorf("mesh tunnel context unavailable")
 	}
 
 	hash := sha256.Sum256(append([]byte(route), payload...))
@@ -139,8 +147,56 @@ func (pr *PeerRoute) AddPeer(peer *PeerIdentity) {
 
 func (pr *PeerRoute) RemovePeer(nodeID NodeID) {
 	pr.mu.Lock()
-	pr.mu.Unlock()
-	delete(pr.peers, hex.EncodeToString(nodeID[:]))
+	defer pr.mu.Unlock()
+	key := hex.EncodeToString(nodeID[:])
+	delete(pr.peers, key)
+	delete(pr.accessPolicies, nodeID)
+}
+
+// GetAccessPolicy returns the mesh ACL for a node (Deny if unset).
+func (pr *PeerRoute) GetAccessPolicy(nodeID NodeID) AccessPolicy {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	if p, ok := pr.accessPolicies[nodeID]; ok {
+		return p
+	}
+	return Deny
+}
+
+// AccessPolicyName is a stable string for APIs and UIs.
+func AccessPolicyName(p AccessPolicy) string {
+	switch p {
+	case ReadOnly:
+		return "readonly"
+	case See:
+		return "see"
+	case Write:
+		return "write"
+	case Admin:
+		return "admin"
+	case Deny:
+		return "deny"
+	default:
+		return "deny"
+	}
+}
+
+// ParseAccessPolicy maps API strings to AccessPolicy.
+func ParseAccessPolicy(s string) (AccessPolicy, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "deny", "none", "block":
+		return Deny, true
+	case "readonly", "read", "ro":
+		return ReadOnly, true
+	case "see", "view":
+		return See, true
+	case "write", "rw":
+		return Write, true
+	case "admin", "owner":
+		return Admin, true
+	default:
+		return Deny, false
+	}
 }
 
 func (pr *PeerRoute) ListPeers() []*PeerIdentity {
